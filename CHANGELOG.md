@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Layer color matrices** — `Context.PushLayerWithColorMatrix(blend, opacity, matrix)` applies a 4×5 RGBA
+  transform (`gg.ColorMatrix`, the SVG `feColorMatrix` / Skia `SkColorMatrix` layout) to a layer's contents
+  on `PopLayer`, before opacity and blending. Draw a HUD group once and tint the whole group toward red on
+  damage, desaturate it when paused, and so on, instead of recoloring every icon. `IdentityColorMatrix`,
+  `NewColorMatrix`, `SaturationColorMatrix`, `GrayscaleColorMatrix`, and `TintColorMatrix` are provided.
+  `NewColorMatrix` returns `ErrColorMatrixSize` for any length other than 20. Layers pushed with
+  `PushLayer` behave exactly as before.
+
+  Behavior at the edges is defined: a non-finite coefficient (NaN or ±Inf) is ignored and the layer
+  composites unchanged; fully transparent pixels stay transparent, so a bias cannot create alpha and an empty
+  layer is a no-op; extreme biases clamp to `[0, 1]`. The transform runs on the CPU after pending GPU work is
+  flushed into the layer pixmap, and layers flush queued work when pushed and popped, so the software and GPU
+  routes composite the same pixels.
+
+### Fixed
+
+- **Translucent layer content composited as `alpha²`** — the layer compositor passed premultiplied bytes to
+  `internal/image.DrawImage` as if they were straight-alpha, so a 50% red layer over white came out pink
+  (`R=0.75`) instead of the red a direct fill produces (`R=1.0`). Layers now composite in premultiplied space
+  with the W3C Compositing and Blending formula and the layer's blend mode, matching a direct draw.
+
 ## [0.52.7] - 2026-11-08
 
 ### Added

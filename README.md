@@ -487,6 +487,49 @@ dc.PushLayer(gg.BlendOverlay, 0.7)
 dc.PopLayer()
 ```
 
+### Layer Color Matrices
+
+Apply one 4×5 RGBA transform to a whole layer after it is drawn, instead of
+recoloring every icon. This is the standard way to tint a HUD on hit, or to
+desaturate a paused game:
+
+```go
+// Damage flash: push the whole HUD group toward red while keeping alpha.
+tint := gg.TintColorMatrix(gg.RGBA{R: 1, G: 0, B: 0, A: 0.45})
+dc.PushLayerWithColorMatrix(gg.BlendNormal, 1.0, tint)
+drawHUD(dc) // icons, bars and text keep their own colors
+dc.PopLayer()
+
+// Paused: desaturate the group.
+dc.PushLayerWithColorMatrix(gg.BlendNormal, 1.0,
+    gg.SaturationColorMatrix(0)) // 0 = grayscale, 1 = unchanged, >1 = oversaturated
+drawHUD(dc)
+dc.PopLayer()
+```
+
+The transform runs on straight-alpha color in `[0, 1]` before the layer's
+opacity and blend mode, using the SVG `feColorMatrix` / Skia `SkColorMatrix`
+layout. The fifth column is a bias in `[0, 1]` units:
+
+```text
+[R']   [m0  m1  m2  m3  m4 ]   [R]
+[G'] = [m5  m6  m7  m8  m9 ] * [G]
+[B']   [m10 m11 m12 m13 m14]   [B]
+[A']   [m15 m16 m17 m18 m19]   [A]
+                                [1]
+```
+
+Custom matrices can be built with `gg.NewColorMatrix(values)` (exactly 20
+coefficients) or a `gg.ColorMatrix{...}` literal. Behavior at the edges:
+
+- A non-finite coefficient (NaN or ±Inf) is ignored and the layer composites
+  unchanged.
+- Fully transparent pixels stay transparent; a bias cannot create alpha from
+  nothing, and an empty layer is a no-op.
+- Output is clamped to `[0, 1]`.
+- The transform runs after pending GPU work is resolved to the layer pixmap,
+  so software and GPU rendering produce the same pixels.
+
 ### Alpha Masks
 
 Per-shape masking — each draw individually masked:

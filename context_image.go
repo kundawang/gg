@@ -644,6 +644,8 @@ func (c *Context) DrawImageCircular(img *ImageBuf, cx, cy, radius float64) {
 
 // pixmapToImageBuf converts a Pixmap to an ImageBuf.
 // This is a zero-copy operation that wraps the pixmap data.
+//
+//nolint:unused // kept for callers that need a zero-copy view of the pixmap
 func (c *Context) pixmapToImageBuf(pm *Pixmap) *ImageBuf {
 	// Pixmap uses RGBA8 format
 	stride := pm.Width() * 4
