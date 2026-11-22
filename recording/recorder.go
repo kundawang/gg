@@ -135,136 +135,33 @@ func (r *Recording) Resources() *ResourcePool {
 }
 
 // Playback replays the recording to the given backend.
+//
+// It drives a [PlaybackSession] through Begin, every command, and End. End is
+// called exactly once even when Begin succeeded but a later command failed, so
+// backends can always release temporary resources. Begin failures are returned
+// as-is without calling End, and a command failure takes precedence over a
+// finalization failure while both remain inspectable via errors.Is/errors.As.
 func (r *Recording) Playback(backend Backend) error {
-	// Initialize backend
-	if err := backend.Begin(r.width, r.height); err != nil {
+	session := NewPlaybackSession(backend, r.resources)
+	if err := session.Begin(r.width, r.height); err != nil {
 		return err
 	}
 
-	transform := Identity()
-	transformStack := make([]Matrix, 0, 8)
-
-	// Replay each command
-	for _, cmd := range r.commands {
-		switch c := cmd.(type) {
-		case SaveCommand:
-			transformStack = append(transformStack, transform)
-			backend.Save()
-		case RestoreCommand:
-			backend.Restore()
-			if len(transformStack) > 0 {
-				transform = transformStack[len(transformStack)-1]
-				transformStack = transformStack[:len(transformStack)-1]
-			}
-		case SetTransformCommand:
-			transform = c.Matrix
-			backend.SetTransform(c.Matrix)
-		case SetClipCommand:
-			path := r.resources.GetPath(c.Path)
-			setPlaybackClip(backend, path, c.Rule, transform)
-		case ClearClipCommand:
-			backend.ClearClip()
-		case ClipRoundRectCommand:
-			rrPath := buildClipRoundRectPath(c, transform)
-			setPlaybackClip(backend, rrPath, FillRuleNonZero, transform)
-		case FillPathCommand:
-			path := r.resources.GetPath(c.Path)
-			brush := r.resources.GetBrush(c.Brush)
-			backend.FillPath(path, brush, c.Rule)
-		case StrokePathCommand:
-			path := r.resources.GetPath(c.Path)
-			brush := r.resources.GetBrush(c.Brush)
-			backend.StrokePath(path, brush, c.Stroke)
-		case FillRectCommand:
-			brush := r.resources.GetBrush(c.Brush)
-			backend.FillRect(c.Rect, brush)
-		case StrokeRectCommand:
-			brush := r.resources.GetBrush(c.Brush)
-			path := gg.BuildPath().Rect(c.Rect.MinX, c.Rect.MinY, c.Rect.Width(), c.Rect.Height()).Build()
-			// StrokeRectCommand stores world-space bounds. Isolate the identity
-			// transform so backends do not apply the recording transform twice,
-			// then restore their complete graphics state for later commands.
-			backend.Save()
-			backend.SetTransform(Identity())
-			backend.StrokePath(path, brush, c.Stroke)
-			backend.Restore()
-		case DrawImageCommand:
-			img := r.resources.GetImage(c.Image)
-			backend.DrawImage(img, c.SrcRect, c.DstRect, c.Options)
-		case DrawTextCommand:
-			brush := r.resources.GetBrush(c.Brush)
-			backend.DrawText(c.Text, c.X, c.Y, c.Face, brush)
-		case StrokeTextCommand:
-			brush := r.resources.GetBrush(c.Brush)
-			backend.DrawText(c.Text, c.X, c.Y, c.Face, brush)
-		// Style commands are handled by the backend's internal state
-		// during the actual drawing operations
-		case SetFillStyleCommand, SetStrokeStyleCommand,
-			SetLineWidthCommand, SetLineCapCommand, SetLineJoinCommand,
-			SetMiterLimitCommand, SetDashCommand, SetFillRuleCommand:
-			// These are state commands that were recorded but the actual
-			// style is captured in the drawing commands themselves
-		}
+	playErr := session.Play(r.commands)
+	endErr := session.End()
+	if playErr != nil {
+		return joinErrors(playErr, endErr)
 	}
-
-	return backend.End()
+	return endErr
 }
 
-// setPlaybackClip applies a world-space clip without disturbing the backend's
-// current transform. Save/Restore cannot be used here because Restore would
-// also discard the newly installed clip.
-func setPlaybackClip(backend Backend, path *gg.Path, rule FillRule, transform Matrix) {
-	backend.SetTransform(Identity())
-	backend.SetClip(path, rule)
-	backend.SetTransform(transform)
-}
-
-// buildClipRoundRectPath builds a world-space rounded-rectangle clip path.
-// For uniform axis-aligned transforms, uses the fast two-corner + scaled radius
-// path. For rotation/shear/non-uniform scale, builds the rounded rect in user
-// space and transforms the full path — matching Context.ClipRoundRect (#503).
-func buildClipRoundRectPath(c ClipRoundRectCommand, t Matrix) *gg.Path {
-	if isUniformAxisAligned(t) {
-		x1, y1 := t.TransformPoint(c.X, c.Y)
-		x2, y2 := t.TransformPoint(c.X+c.W, c.Y+c.H)
-		x := math.Min(x1, x2)
-		y := math.Min(y1, y2)
-		w := math.Abs(x2 - x1)
-		h := math.Abs(y2 - y1)
-		radius := 0.0
-		if c.Radius > 0 {
-			radius = c.Radius * t.ScaleFactor()
-			radius = math.Min(radius, math.Min(w, h)/2)
-		}
-		return gg.BuildPath().RoundRect(x, y, w, h, radius).Build()
-	}
-	px, py := c.X, c.Y
-	pw, ph := math.Abs(c.W), math.Abs(c.H)
-	if c.W < 0 {
-		px += c.W
-	}
-	if c.H < 0 {
-		py += c.H
-	}
-	userPath := gg.NewPath()
-	userPath.RoundedRectangle(px, py, pw, ph, c.Radius)
-	return userPath.Transform(gg.Matrix{
-		A: t.A, B: t.B, C: t.C,
-		D: t.D, E: t.E, F: t.F,
-	})
-}
-
-// isUniformAxisAligned reports whether the transform keeps rounded rectangles
-// axis-aligned with circular (not elliptical) corners.
-func isUniformAxisAligned(t Matrix) bool {
-	switch {
-	case t.B == 0 && t.D == 0:
-		return math.Abs(t.A) == math.Abs(t.E)
-	case t.A == 0 && t.E == 0:
-		return math.Abs(t.B) == math.Abs(t.D)
-	default:
-		return false
-	}
+// NewPlaybackSession creates a session for this recording's resources and
+// dimensions. The session is not begun: call Begin, then Play (or Dispatch
+// individual commands), then End. This is the advanced entry point for callers
+// that need to inspect the mirrored state or feed commands incrementally.
+// Most callers should use Playback instead.
+func (r *Recording) NewPlaybackSession(backend Backend) *PlaybackSession {
+	return NewPlaybackSession(backend, r.resources)
 }
 
 // --------------------------------------------------------------------------

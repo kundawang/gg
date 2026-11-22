@@ -6,10 +6,12 @@
 //
 // # Architecture
 //
-// The system follows a Command Pattern with three main components:
+// The recording system follows a Command Pattern with four main components:
 //
 //   - Recorder: Captures drawing operations as commands
 //   - Recording: Stores commands and resources for playback
+//   - PlaybackSession: Owns the backend lifecycle, mirrored graphics state,
+//     resource resolution, and command dispatch for playback
 //   - Backend: Renders commands to a specific output format
 //
 // This design is inspired by Skia's SkPicture and Cairo's recording surface.
@@ -55,6 +57,33 @@
 //	rasterBackend, _ := recording.NewBackend("raster")
 //	r.Playback(rasterBackend)
 //	rasterBackend.(recording.PixmapBackend).Pixmap() // Get pixel data
+//
+// # Playback Sessions
+//
+// Playback is implemented by [PlaybackSession], which owns the backend
+// lifecycle (Begin/End), the mirrored Save/Restore transform stack, resource
+// resolution, and command dispatch. Recording.Playback drives one session from
+// start to finish. Callers that need finer control can construct a session
+// directly and dispatch commands one at a time:
+//
+//	session := r.NewPlaybackSession(backend)
+//	if err := session.Begin(r.Width(), r.Height()); err != nil { ... }
+//	defer session.End()
+//	for _, cmd := range r.Commands() {
+//	    if err := session.Dispatch(cmd); err != nil { ... }
+//	}
+//
+// The session guarantees:
+//
+//   - Begin is called once; a failed Begin is returned as-is and End is skipped.
+//   - End is called exactly once, even after a command fails or panics.
+//   - Backend panics are recovered and wrapped in [BackendPanicError].
+//   - Unknown commands (including nil) return [UnknownCommandError], which
+//     matches [ErrUnknownCommand] with errors.Is.
+//   - An unmatched Restore is still forwarded to the backend while leaving the
+//     mirrored transform unchanged.
+//   - The mirrored state stack is never exposed as a mutable slice;
+//     [PlaybackSession.Transforms] returns a copy.
 //
 // # Backend Registration
 //

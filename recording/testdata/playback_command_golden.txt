@@ -1,0 +1,148 @@
+== all_commands ==
+Begin 120 90
+Save
+SetTransform [1 0 10 0 1 12]
+SetTransform [1.5 0 10 0 0.75 12]
+SetTransform [1.433 -0.44328 10 0.22164 0.716502 12]
+SetTransform [1.34435 -0.29998 10 0.364941 0.738666 12]
+SetTransform [1 0 2 0 1 3]
+SetTransform [1 0 0 0 1 0]
+Save
+SetTransform [1 0 30 0 1 30]
+SetTransform [20 0 30 0 10 30]
+Restore
+FillPath {MoveTo(50,30)CubicTo(50,33.4011,46.5298,36.5771,40.806,38.4147)CubicTo(35.0823,40.2523,27.8622,40.5083,21.6771,39.093)MoveTo(11,5)LineTo(39,5)CubicTo(42.2915,5,45,7.7085,45,11)LineTo(45,29)CubicTo(45,32.2915,42.2915,35,39,35)LineTo(11,35)CubicTo(7.7085,35,5,32.2915,5,29)LineTo(5,11)CubicTo(5,7.7085,7.7085,5,11,5)Close()} solid(0.100,0.200,0.300,1.000) 1
+StrokePath {MoveTo(50,30)CubicTo(50,33.4011,46.5298,36.5771,40.806,38.4147)CubicTo(35.0823,40.2523,27.8622,40.5083,21.6771,39.093)MoveTo(11,5)LineTo(39,5)CubicTo(42.2915,5,45,7.7085,45,11)LineTo(45,29)CubicTo(45,32.2915,42.2915,35,39,35)LineTo(11,35)CubicTo(7.7085,35,5,32.2915,5,29)LineTo(5,11)CubicTo(5,7.7085,7.7085,5,11,5)Close()} solid(0.300,0.200,0.100,0.900) stroke(w=2.5 cap=1 join=2 miter=6 dash=[4 2] off=1.5)
+DrawImage (0,0)-(8,6) [0 0 8 6] [10 10 18 16] 1 1.000
+DrawImage (0,0)-(8,6) [0 0 8 6] [46 37 54 43] 1 1.000
+DrawImage (0,0)-(8,6) [0 0 8 6] [60 10 80 25] 1 1.000
+DrawText "golden" 8 70 face=24.000 solid(0.100,0.200,0.300,1.000)
+DrawText "anch" 34.5 76.9375 face=24.000 solid(0.100,0.200,0.300,1.000)
+DrawText "outline" 80 82 face=24.000 solid(0.300,0.200,0.100,0.900)
+DrawText "anch2" 36 77.3711 face=24.000 solid(0.300,0.200,0.100,0.900)
+Restore
+End
+== clip_roundrect_identity ==
+Begin 120 120
+SetTransform [1 0 0 0 1 0]
+SetTransform [1 0 0 0 1 0]
+SetClip {MoveTo(32,20)LineTo(48,20)CubicTo(54.6274,20,60,25.3726,60,32)LineTo(60,38)CubicTo(60,44.6274,54.6274,50,48,50)LineTo(32,50)CubicTo(25.3726,50,20,44.6274,20,38)LineTo(20,32)CubicTo(20,25.3726,25.3726,20,32,20)Close()} 0
+SetTransform [1 0 0 0 1 0]
+SetTransform [1 0 0 0 1 0]
+SetClip {MoveTo(10,10)LineTo(30,10)CubicTo(30,10,30,10,30,10)LineTo(30,30)CubicTo(30,30,30,30,30,30)LineTo(10,30)CubicTo(10,30,10,30,10,30)LineTo(10,10)CubicTo(10,10,10,10,10,10)Close()} 0
+SetTransform [1 0 0 0 1 0]
+FillRect [0 0 120 120] solid(1.000,0.000,0.000,1.000)
+End
+== clip_roundrect_mirror ==
+Begin 120 120
+SetTransform [-1 0 130 0 1 0]
+SetTransform [1 0 0 0 1 0]
+SetClip {MoveTo(82,20)LineTo(98,20)CubicTo(104.627,20,110,25.3726,110,32)LineTo(110,38)CubicTo(110,44.6274,104.627,50,98,50)LineTo(82,50)CubicTo(75.3726,50,70,44.6274,70,38)LineTo(70,32)CubicTo(70,25.3726,75.3726,20,82,20)Close()} 0
+SetTransform [-1 0 130 0 1 0]
+SetTransform [1 0 0 0 1 0]
+SetClip {MoveTo(100,10)LineTo(120,10)CubicTo(120,10,120,10,120,10)LineTo(120,30)CubicTo(120,30,120,30,120,30)LineTo(100,30)CubicTo(100,30,100,30,100,30)LineTo(100,10)CubicTo(100,10,100,10,100,10)Close()} 0
+SetTransform [-1 0 130 0 1 0]
+FillRect [10 0 130 120] solid(1.000,0.000,0.000,1.000)
+End
+== clip_roundrect_rotate ==
+Begin 120 120
+SetTransform [0.877583 -0.479426 60 0.479426 0.877583 5]
+SetTransform [1 0 0 0 1 0]
+SetClip {MoveTo(78.4941,37.8933)LineTo(92.5355,45.5641)CubicTo(98.3126,48.7201,100.469,56.071,97.3133,61.8482)LineTo(94.4368,67.1137)CubicTo(91.2807,72.8908,83.9298,75.0476,78.1527,71.8916)LineTo(64.1114,64.2207)CubicTo(58.3342,61.0647,56.1774,53.7138,59.3335,47.9366)LineTo(62.21,42.6712)CubicTo(65.3661,36.894,72.717,34.7372,78.4941,37.8933)Close()} 0
+SetTransform [0.877583 -0.479426 60 0.479426 0.877583 5]
+SetTransform [1 0 0 0 1 0]
+SetClip {MoveTo(63.9816,18.5701)LineTo(81.5332,28.1586)CubicTo(81.5332,28.1586,81.5332,28.1586,81.5332,28.1586)LineTo(71.9447,45.7102)CubicTo(71.9447,45.7102,71.9447,45.7102,71.9447,45.7102)LineTo(54.3931,36.1217)CubicTo(54.3931,36.1217,54.3931,36.1217,54.3931,36.1217)LineTo(63.9816,18.5701)CubicTo(63.9816,18.5701,63.9816,18.5701,63.9816,18.5701)Close()} 0
+SetTransform [0.877583 -0.479426 60 0.479426 0.877583 5]
+FillRect [60 5 107.779 167.841] solid(1.000,0.000,0.000,1.000)
+End
+== clip_roundrect_scale ==
+Begin 120 120
+SetTransform [1.5 0 5 0 0.75 5]
+SetTransform [1 0 0 0 1 0]
+SetClip {MoveTo(53,20)LineTo(77,20)CubicTo(86.8745,20,95,24.0627,95,29)LineTo(95,33.5)CubicTo(95,38.4373,86.8745,42.5,77,42.5)LineTo(53,42.5)CubicTo(43.1255,42.5,35,38.4373,35,33.5)LineTo(35,29)CubicTo(35,24.0627,43.1255,20,53,20)Close()} 0
+SetTransform [1.5 0 5 0 0.75 5]
+SetTransform [1 0 0 0 1 0]
+SetClip {MoveTo(20,12.5)LineTo(50,12.5)CubicTo(50,12.5,50,12.5,50,12.5)LineTo(50,27.5)CubicTo(50,27.5,50,27.5,50,27.5)LineTo(20,27.5)CubicTo(20,27.5,20,27.5,20,27.5)LineTo(20,12.5)CubicTo(20,12.5,20,12.5,20,12.5)Close()} 0
+SetTransform [1.5 0 5 0 0.75 5]
+FillRect [5 5 185 95] solid(1.000,0.000,0.000,1.000)
+End
+== clip_roundrect_shear ==
+Begin 120 120
+SetTransform [1 0.6 5 0.2 1 5]
+SetTransform [1 0 0 0 1 0]
+SetClip {MoveTo(49,31.4)LineTo(65,34.6)CubicTo(71.583,35.9166,80.2502,42.417,84.2,49)LineTo(87.8,55)CubicTo(91.7498,61.583,89.583,65.9166,83,64.6)LineTo(67,61.4)CubicTo(60.417,60.0834,51.7498,53.583,47.8,47)LineTo(44.2,41)CubicTo(40.2502,34.417,42.417,30.0834,49,31.4)Close()} 0
+SetTransform [1 0.6 5 0.2 1 5]
+SetTransform [1 0 0 0 1 0]
+SetClip {MoveTo(21,17)LineTo(41,21)CubicTo(41,21,41,21,41,21)LineTo(53,41)CubicTo(53,41,53,41,53,41)LineTo(33,37)CubicTo(33,37,33,37,33,37)LineTo(21,17)CubicTo(21,17,21,17,21,17)Close()} 0
+SetTransform [1 0.6 5 0.2 1 5]
+FillRect [5 5 197 149] solid(1.000,0.000,0.000,1.000)
+End
+== clip_roundrect_translate ==
+Begin 120 120
+SetTransform [1 0 15 0 1 8]
+SetTransform [1 0 0 0 1 0]
+SetClip {MoveTo(47,28)LineTo(63,28)CubicTo(69.6274,28,75,33.3726,75,40)LineTo(75,46)CubicTo(75,52.6274,69.6274,58,63,58)LineTo(47,58)CubicTo(40.3726,58,35,52.6274,35,46)LineTo(35,40)CubicTo(35,33.3726,40.3726,28,47,28)Close()} 0
+SetTransform [1 0 15 0 1 8]
+SetTransform [1 0 0 0 1 0]
+SetClip {MoveTo(25,18)LineTo(45,18)CubicTo(45,18,45,18,45,18)LineTo(45,38)CubicTo(45,38,45,38,45,38)LineTo(25,38)CubicTo(25,38,25,38,25,38)LineTo(25,18)CubicTo(25,18,25,18,25,18)Close()} 0
+SetTransform [1 0 15 0 1 8]
+FillRect [15 8 135 128] solid(1.000,0.000,0.000,1.000)
+End
+== clip_roundrect_uniform ==
+Begin 120 120
+SetTransform [2 0 5 0 2 5]
+SetTransform [1 0 0 0 1 0]
+SetClip {MoveTo(69,45)LineTo(101,45)CubicTo(114.255,45,125,55.7452,125,69)LineTo(125,81)CubicTo(125,94.2548,114.255,105,101,105)LineTo(69,105)CubicTo(55.7452,105,45,94.2548,45,81)LineTo(45,69)CubicTo(45,55.7452,55.7452,45,69,45)Close()} 0
+SetTransform [2 0 5 0 2 5]
+SetTransform [1 0 0 0 1 0]
+SetClip {MoveTo(25,25)LineTo(65,25)CubicTo(65,25,65,25,65,25)LineTo(65,65)CubicTo(65,65,65,65,65,65)LineTo(25,65)CubicTo(25,65,25,65,25,65)LineTo(25,25)CubicTo(25,25,25,25,25,25)Close()} 0
+SetTransform [2 0 5 0 2 5]
+FillRect [5 5 245 245] solid(1.000,0.000,0.000,1.000)
+End
+== nested_state ==
+Begin 100 100
+Save
+SetTransform [1 0 10 0 1 10]
+SetTransform [1 0 0 0 1 0]
+SetClip {MoveTo(10,10)LineTo(30,10)LineTo(30,30)LineTo(10,30)Close()} 0
+SetTransform [1 0 10 0 1 10]
+Save
+SetTransform [2 0 10 0 2 10]
+SetTransform [1 0 0 0 1 0]
+SetClip {MoveTo(28,20)LineTo(72,20)CubicTo(76.4183,20,80,23.5817,80,28)LineTo(80,52)CubicTo(80,56.4183,76.4183,60,72,60)LineTo(28,60)CubicTo(23.5817,60,20,56.4183,20,52)LineTo(20,28)CubicTo(20,23.5817,23.5817,20,28,20)Close()} 0
+SetTransform [2 0 10 0 2 10]
+FillPath {MoveTo(20,20)LineTo(40,20)LineTo(40,40)LineTo(20,40)Close()} solid(0.000,0.000,0.000,1.000) 0
+Restore
+ClearClip
+Restore
+StrokePath {MoveTo(70,50)CubicTo(70,61.0457,61.0457,70,50,70)CubicTo(38.9543,70,30,61.0457,30,50)CubicTo(30,38.9543,38.9543,30,50,30)CubicTo(61.0457,30,70,38.9543,70,50)Close()} solid(0.000,0.000,0.000,1.000) stroke(w=1 cap=0 join=0 miter=4 dash=[] off=0)
+End
+== stroke_rect_compact ==
+Begin 120 120
+SetTransform [1 0 10 0 1 15]
+Save
+SetTransform [1 0 0 0 1 0]
+StrokePath {MoveTo(20,35)LineTo(50,35)LineTo(50,75)LineTo(20,75)Close()} solid(0.000,0.000,1.000,1.000) stroke(w=3 cap=0 join=0 miter=4 dash=[4 2] off=0)
+Restore
+End
+== stroke_rect_negative ==
+Begin 120 120
+SetTransform [1 0 0 0 1 0]
+Save
+SetTransform [1 0 0 0 1 0]
+StrokePath {MoveTo(80,80)LineTo(20,80)LineTo(20,20)LineTo(80,20)Close()} solid(0.000,0.000,1.000,1.000) stroke(w=3 cap=0 join=0 miter=4 dash=[4 2] off=0)
+Restore
+End
+== stroke_rect_rotation ==
+Begin 120 120
+SetTransform [0 -1 100 1 0 0]
+Save
+SetTransform [1 0 0 0 1 0]
+StrokePath {MoveTo(80,10)LineTo(80,40)LineTo(40,40)LineTo(40,10)Close()} solid(0.000,0.000,1.000,1.000) stroke(w=3 cap=0 join=0 miter=4 dash=[4 2] off=0)
+Restore
+End
+== unbalanced_restore ==
+Begin 50 50
+SetTransform [1 0 7 0 1 9]
+FillPath {MoveTo(11,11)CubicTo(11,12.6569,9.65685,14,8,14)CubicTo(6.34315,14,5,12.6569,5,11)CubicTo(5,9.34315,6.34315,8,8,8)CubicTo(9.65685,8,11,9.34315,11,11)Close()} solid(0.000,0.000,0.000,1.000) 0
+End
