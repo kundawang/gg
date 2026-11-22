@@ -66,6 +66,9 @@ const (
 	CmdSetDash        // Set dash pattern
 	CmdSetFillRule    // Set fill rule
 	CmdSetAntiAlias   // Set anti-aliasing mode
+
+	// Marker commands
+	CmdLabel // Named position marker (no drawing semantics)
 )
 
 // commandTypeNames maps CommandType values to their string representation.
@@ -92,6 +95,7 @@ var commandTypeNames = [...]string{
 	CmdSetDash:        "SetDash",
 	CmdSetFillRule:    "SetFillRule",
 	CmdSetAntiAlias:   "SetAntiAlias",
+	CmdLabel:          "Label",
 }
 
 // String returns the string representation of a CommandType.
@@ -406,6 +410,22 @@ type SetAntiAliasCommand struct {
 
 // Type implements Command.
 func (SetAntiAliasCommand) Type() CommandType { return CmdSetAntiAlias }
+
+// --------------------------------------------------------------------------
+// Marker Commands
+// --------------------------------------------------------------------------
+
+// LabelCommand marks a named position in the command stream.
+// Labels carry no drawing semantics; playback ignores them. They exist so
+// that tools (e.g. timeline editors) can address command ranges by name
+// via Recording.CursorForLabel and Recording.CursorBetweenLabels.
+type LabelCommand struct {
+	// Name is the label identifying this position in the stream.
+	Name string
+}
+
+// Type implements Command.
+func (LabelCommand) Type() CommandType { return CmdLabel }
 
 // --------------------------------------------------------------------------
 // Supporting Types

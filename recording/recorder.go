@@ -134,6 +134,18 @@ func (r *Recording) Resources() *ResourcePool {
 	return r.resources
 }
 
+// LabelIndex returns the command index of the first occurrence of the given
+// label recorded with Recorder.Mark. The second return value reports whether
+// the label exists in the recording.
+func (r *Recording) LabelIndex(label string) (int, bool) {
+	for i, cmd := range r.commands {
+		if c, ok := cmd.(LabelCommand); ok && c.Name == label {
+			return i, true
+		}
+	}
+	return -1, false
+}
+
 // Playback replays the recording to the given backend.
 func (r *Recording) Playback(backend Backend) error {
 	// Initialize backend
@@ -141,71 +153,16 @@ func (r *Recording) Playback(backend Backend) error {
 		return err
 	}
 
-	transform := Identity()
-	transformStack := make([]Matrix, 0, 8)
+	e := newExecutor(backend, r.resources)
 
 	// Replay each command
 	for _, cmd := range r.commands {
-		switch c := cmd.(type) {
-		case SaveCommand:
-			transformStack = append(transformStack, transform)
-			backend.Save()
-		case RestoreCommand:
-			backend.Restore()
-			if len(transformStack) > 0 {
-				transform = transformStack[len(transformStack)-1]
-				transformStack = transformStack[:len(transformStack)-1]
-			}
-		case SetTransformCommand:
-			transform = c.Matrix
-			backend.SetTransform(c.Matrix)
-		case SetClipCommand:
-			path := r.resources.GetPath(c.Path)
-			setPlaybackClip(backend, path, c.Rule, transform)
-		case ClearClipCommand:
-			backend.ClearClip()
-		case ClipRoundRectCommand:
-			rrPath := buildClipRoundRectPath(c, transform)
-			setPlaybackClip(backend, rrPath, FillRuleNonZero, transform)
-		case FillPathCommand:
-			path := r.resources.GetPath(c.Path)
-			brush := r.resources.GetBrush(c.Brush)
-			backend.FillPath(path, brush, c.Rule)
-		case StrokePathCommand:
-			path := r.resources.GetPath(c.Path)
-			brush := r.resources.GetBrush(c.Brush)
-			backend.StrokePath(path, brush, c.Stroke)
-		case FillRectCommand:
-			brush := r.resources.GetBrush(c.Brush)
-			backend.FillRect(c.Rect, brush)
-		case StrokeRectCommand:
-			brush := r.resources.GetBrush(c.Brush)
-			path := gg.BuildPath().Rect(c.Rect.MinX, c.Rect.MinY, c.Rect.Width(), c.Rect.Height()).Build()
-			// StrokeRectCommand stores world-space bounds. Isolate the identity
-			// transform so backends do not apply the recording transform twice,
-			// then restore their complete graphics state for later commands.
-			backend.Save()
-			backend.SetTransform(Identity())
-			backend.StrokePath(path, brush, c.Stroke)
-			backend.Restore()
-		case DrawImageCommand:
-			img := r.resources.GetImage(c.Image)
-			backend.DrawImage(img, c.SrcRect, c.DstRect, c.Options)
-		case DrawTextCommand:
-			brush := r.resources.GetBrush(c.Brush)
-			backend.DrawText(c.Text, c.X, c.Y, c.Face, brush)
-		case StrokeTextCommand:
-			brush := r.resources.GetBrush(c.Brush)
-			backend.DrawText(c.Text, c.X, c.Y, c.Face, brush)
-		// Style commands are handled by the backend's internal state
-		// during the actual drawing operations
-		case SetFillStyleCommand, SetStrokeStyleCommand,
-			SetLineWidthCommand, SetLineCapCommand, SetLineJoinCommand,
-			SetMiterLimitCommand, SetDashCommand, SetFillRuleCommand:
-			// These are state commands that were recorded but the actual
-			// style is captured in the drawing commands themselves
-		}
+		e.apply(cmd)
 	}
+
+	// Unwind any Save commands left unbalanced by the stream so the
+	// backend's state stack returns to its initial depth.
+	e.unwind()
 
 	return backend.End()
 }
@@ -351,6 +308,14 @@ func (r *Recorder) Push() {
 // Pop is an alias for Restore, matching gg.Context API.
 func (r *Recorder) Pop() {
 	r.Restore()
+}
+
+// Mark records a named label at the current command position.
+// Labels are no-op markers: playback ignores them, but they can be used to
+// create playback cursors for label-delimited command ranges via
+// Recording.CursorForLabel and Recording.CursorBetweenLabels.
+func (r *Recorder) Mark(label string) {
+	r.commands = append(r.commands, LabelCommand{Name: label})
 }
 
 // --------------------------------------------------------------------------
