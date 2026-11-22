@@ -149,6 +149,33 @@
 // Recorder instance. However, Recording objects are immutable after Finish()
 // and can be safely shared and played back from multiple goroutines.
 //
+// # Structured Replay Tracing
+//
+// When different backends produce different pixels, the final image alone
+// cannot identify which command changed observable state. Recording exposes
+// a structured trace for this quality-gate use case:
+//
+//	err := r.TracePlayback(backend, recording.TraceOptions{Writer: logFile})
+//
+// TracePlayback drives the exact same dispatch path as Playback while
+// emitting one event per lifecycle phase and per command. Each event records
+// the command index and type, summaries of the path/brush/image/font
+// resources it references (no pixel buffers, font tables or coordinate
+// arrays), the reconstructed transform and clip state, and the backend's
+// result including the number of Backend methods the dispatch invoked.
+//
+// Output goes either to an io.Writer as one JSON object per line (JSONL) or
+// to an OnEvent callback for in-memory comparison; exactly one sink is
+// allowed. The trace is deterministic for a Recording: replaying twice
+// yields byte-identical JSONL, and every numeric value is validated so NaN
+// or Inf can never corrupt the stream (the run returns ErrNonFinite instead).
+// Data-borne strings are bounded by MaxStringLength (ErrStringTooLong), and
+// backend error messages are truncated with an explicit marker rather than
+// dropped. TraceEvents is a convenience wrapper that collects events for
+// event-by-event comparison of two backends, and FailAfter injects a
+// deterministic mid-playback failure. Tracing never mutates the Recording or
+// changes plain Playback behavior.
+//
 // # Performance Considerations
 //
 // The recording system is optimized for:

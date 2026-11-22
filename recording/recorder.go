@@ -136,78 +136,197 @@ func (r *Recording) Resources() *ResourcePool {
 
 // Playback replays the recording to the given backend.
 func (r *Recording) Playback(backend Backend) error {
-	// Initialize backend
+	if backend == nil {
+		return ErrNilBackend
+	}
+	engine := newPlaybackEngine(backend, r.width, r.height)
 	if err := backend.Begin(r.width, r.height); err != nil {
 		return err
 	}
 
-	transform := Identity()
-	transformStack := make([]Matrix, 0, 8)
-
-	// Replay each command
 	for _, cmd := range r.commands {
-		switch c := cmd.(type) {
-		case SaveCommand:
-			transformStack = append(transformStack, transform)
-			backend.Save()
-		case RestoreCommand:
-			backend.Restore()
-			if len(transformStack) > 0 {
-				transform = transformStack[len(transformStack)-1]
-				transformStack = transformStack[:len(transformStack)-1]
-			}
-		case SetTransformCommand:
-			transform = c.Matrix
-			backend.SetTransform(c.Matrix)
-		case SetClipCommand:
-			path := r.resources.GetPath(c.Path)
-			setPlaybackClip(backend, path, c.Rule, transform)
-		case ClearClipCommand:
-			backend.ClearClip()
-		case ClipRoundRectCommand:
-			rrPath := buildClipRoundRectPath(c, transform)
-			setPlaybackClip(backend, rrPath, FillRuleNonZero, transform)
-		case FillPathCommand:
-			path := r.resources.GetPath(c.Path)
-			brush := r.resources.GetBrush(c.Brush)
-			backend.FillPath(path, brush, c.Rule)
-		case StrokePathCommand:
-			path := r.resources.GetPath(c.Path)
-			brush := r.resources.GetBrush(c.Brush)
-			backend.StrokePath(path, brush, c.Stroke)
-		case FillRectCommand:
-			brush := r.resources.GetBrush(c.Brush)
-			backend.FillRect(c.Rect, brush)
-		case StrokeRectCommand:
-			brush := r.resources.GetBrush(c.Brush)
-			path := gg.BuildPath().Rect(c.Rect.MinX, c.Rect.MinY, c.Rect.Width(), c.Rect.Height()).Build()
-			// StrokeRectCommand stores world-space bounds. Isolate the identity
-			// transform so backends do not apply the recording transform twice,
-			// then restore their complete graphics state for later commands.
-			backend.Save()
-			backend.SetTransform(Identity())
-			backend.StrokePath(path, brush, c.Stroke)
-			backend.Restore()
-		case DrawImageCommand:
-			img := r.resources.GetImage(c.Image)
-			backend.DrawImage(img, c.SrcRect, c.DstRect, c.Options)
-		case DrawTextCommand:
-			brush := r.resources.GetBrush(c.Brush)
-			backend.DrawText(c.Text, c.X, c.Y, c.Face, brush)
-		case StrokeTextCommand:
-			brush := r.resources.GetBrush(c.Brush)
-			backend.DrawText(c.Text, c.X, c.Y, c.Face, brush)
-		// Style commands are handled by the backend's internal state
-		// during the actual drawing operations
-		case SetFillStyleCommand, SetStrokeStyleCommand,
-			SetLineWidthCommand, SetLineCapCommand, SetLineJoinCommand,
-			SetMiterLimitCommand, SetDashCommand, SetFillRuleCommand:
-			// These are state commands that were recorded but the actual
-			// style is captured in the drawing commands themselves
-		}
+		r.dispatch(engine, cmd)
 	}
 
 	return backend.End()
+}
+
+// newPlaybackEngine creates replay state matching the historical Playback
+// defaults: identity transform and empty Save/Restore stacks.
+func newPlaybackEngine(backend Backend, width, height int) *playbackEngine {
+	return &playbackEngine{
+		backend:        backend,
+		width:          width,
+		height:         height,
+		transform:      Identity(),
+		transformStack: make([]Matrix, 0, 8),
+	}
+}
+
+// playbackEngine carries the mutable replay state shared by Playback and
+// TracePlayback. Both entry points drive the exact same dispatch path, so a
+// trace can never drift from the behavior of a normal replay.
+type playbackEngine struct {
+	backend Backend
+	width   int
+	height  int
+
+	// transform mirrors the recording-side matrix reconstructed during
+	// replay. SetTransform/Save/Restore maintain it exactly as Playback did.
+	transform      Matrix
+	transformStack []Matrix
+
+	// clipDepth counts active clip regions so the trace can describe the
+	// clip state without the Backend interface exposing it. SetClip and
+	// ClipRoundRect increment it, ClearClip resets it to zero, and
+	// Save/Restore snapshot it on a parallel stack.
+	clipDepth      int
+	clipDepthStack []int
+	lastClipPath   *gg.Path
+	lastClipRef    PathRef
+	lastClipStack  []clipSnapshot
+}
+
+// clipSnapshot stores the clip state captured by a Save command so Restore
+// can reinstate it exactly during replay.
+type clipSnapshot struct {
+	path *gg.Path
+	ref  PathRef
+}
+
+// dispatch executes one command against the engine's backend, updating the
+// replay state identically for plain Playback and traced Playback.
+func (r *Recording) dispatch(engine *playbackEngine, cmd Command) {
+	switch c := cmd.(type) {
+	case SaveCommand, RestoreCommand, SetTransformCommand,
+		SetClipCommand, ClearClipCommand, ClipRoundRectCommand:
+		r.dispatchState(engine, c)
+	case FillPathCommand, StrokePathCommand, FillRectCommand,
+		StrokeRectCommand, DrawImageCommand, DrawTextCommand, StrokeTextCommand:
+		r.dispatchDraw(engine, c)
+	// Style commands are handled by the backend's internal state during the
+	// actual drawing operations. SetAntiAliasCommand has no Backend hook and
+	// falls through here as an intentional no-op, matching the original
+	// Playback switch.
+	case SetFillStyleCommand, SetStrokeStyleCommand,
+		SetLineWidthCommand, SetLineCapCommand, SetLineJoinCommand,
+		SetMiterLimitCommand, SetDashCommand, SetFillRuleCommand,
+		SetAntiAliasCommand:
+		// The actual style is captured in the drawing commands themselves.
+	}
+}
+
+// dispatchState handles the state, transform and clip commands that mutate
+// the engine's replay bookkeeping.
+func (r *Recording) dispatchState(engine *playbackEngine, cmd Command) {
+	backend := engine.backend
+	switch c := cmd.(type) {
+	case SaveCommand:
+		engine.pushState()
+		backend.Save()
+	case RestoreCommand:
+		backend.Restore()
+		engine.popState()
+	case SetTransformCommand:
+		engine.transform = c.Matrix
+		backend.SetTransform(c.Matrix)
+	case SetClipCommand:
+		path := r.resources.GetPath(c.Path)
+		setPlaybackClip(backend, path, c.Rule, engine.transform)
+		engine.noteClip(path, c.Path)
+	case ClearClipCommand:
+		backend.ClearClip()
+		engine.clearClip()
+	case ClipRoundRectCommand:
+		rrPath := buildClipRoundRectPath(c, engine.transform)
+		setPlaybackClip(backend, rrPath, FillRuleNonZero, engine.transform)
+		engine.noteClip(rrPath, PathRef(InvalidRef))
+	}
+}
+
+// dispatchDraw handles the pixel-producing commands.
+func (r *Recording) dispatchDraw(engine *playbackEngine, cmd Command) {
+	backend := engine.backend
+	switch c := cmd.(type) {
+	case FillPathCommand:
+		path := r.resources.GetPath(c.Path)
+		brush := r.resources.GetBrush(c.Brush)
+		backend.FillPath(path, brush, c.Rule)
+	case StrokePathCommand:
+		path := r.resources.GetPath(c.Path)
+		brush := r.resources.GetBrush(c.Brush)
+		backend.StrokePath(path, brush, c.Stroke)
+	case FillRectCommand:
+		brush := r.resources.GetBrush(c.Brush)
+		backend.FillRect(c.Rect, brush)
+	case StrokeRectCommand:
+		r.dispatchStrokeRect(backend, c)
+	case DrawImageCommand:
+		img := r.resources.GetImage(c.Image)
+		backend.DrawImage(img, c.SrcRect, c.DstRect, c.Options)
+	case DrawTextCommand:
+		brush := r.resources.GetBrush(c.Brush)
+		backend.DrawText(c.Text, c.X, c.Y, c.Face, brush)
+	case StrokeTextCommand:
+		brush := r.resources.GetBrush(c.Brush)
+		backend.DrawText(c.Text, c.X, c.Y, c.Face, brush)
+	}
+}
+
+// dispatchStrokeRect isolates the identity transform around a world-space
+// rect path so backends do not apply the recording transform twice, then
+// restores the complete graphics state for later commands.
+func (r *Recording) dispatchStrokeRect(backend Backend, c StrokeRectCommand) {
+	brush := r.resources.GetBrush(c.Brush)
+	path := gg.BuildPath().Rect(c.Rect.MinX, c.Rect.MinY, c.Rect.Width(), c.Rect.Height()).Build()
+	backend.Save()
+	backend.SetTransform(Identity())
+	backend.StrokePath(path, brush, c.Stroke)
+	backend.Restore()
+}
+
+// pushState snapshots the transform and clip state on the replay stacks.
+func (e *playbackEngine) pushState() {
+	e.transformStack = append(e.transformStack, e.transform)
+	e.clipDepthStack = append(e.clipDepthStack, e.clipDepth)
+	e.lastClipStack = append(e.lastClipStack, clipSnapshot{
+		path: e.lastClipPath,
+		ref:  e.lastClipRef,
+	})
+}
+
+// popState reinstates the transform and clip state captured by the matching
+// pushState. Empty stacks are tolerated to preserve historical Playback
+// behavior for unmatched Restore commands.
+func (e *playbackEngine) popState() {
+	if n := len(e.transformStack); n > 0 {
+		e.transform = e.transformStack[n-1]
+		e.transformStack = e.transformStack[:n-1]
+	}
+	if n := len(e.clipDepthStack); n > 0 {
+		e.clipDepth = e.clipDepthStack[n-1]
+		e.clipDepthStack = e.clipDepthStack[:n-1]
+	}
+	if n := len(e.lastClipStack); n > 0 {
+		snap := e.lastClipStack[n-1]
+		e.lastClipPath = snap.path
+		e.lastClipRef = snap.ref
+		e.lastClipStack = e.lastClipStack[:n-1]
+	}
+}
+
+// noteClip records an installed clip for trace state reconstruction.
+func (e *playbackEngine) noteClip(path *gg.Path, ref PathRef) {
+	e.clipDepth++
+	e.lastClipPath = path
+	e.lastClipRef = ref
+}
+
+// clearClip resets the replay clip state.
+func (e *playbackEngine) clearClip() {
+	e.clipDepth = 0
+	e.lastClipPath = nil
+	e.lastClipRef = 0
 }
 
 // setPlaybackClip applies a world-space clip without disturbing the backend's
