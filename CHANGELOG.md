@@ -35,6 +35,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Recording command compression** — `recording.Compress(rec, CompressOptions{Enabled: true})`
+  (and `Recording.Compress`) collapses adjacent transform, style and `ClearClip` commands whose
+  final effect is equivalent, keeping only the last write per state slot within each run of
+  consecutive state commands. Save/Restore, clip-set commands, drawing commands and unknown
+  commands delimit runs and are never removed or reordered across; the resource pool is shared
+  untouched, so every retained resource reference and Playback pixels are identical.
+  `Recorder.SetCompressionEnabled(true)` opts `FinishRecording` into compression; compression
+  stays off by default, and `CompressOptions{Enabled: false}` is the compatibility entry that
+  returns the input unchanged. `CompressionStats` reports removed (redundant vs. superseded) and
+  retained (barrier vs. last-write vs. unknown) command counts, plus non-finite matrix,
+  unbalanced-restore and max-stack-depth diagnostics.
+
 - **`render.NullDeviceHandle` implements `Features()` and `DownlevelCapabilities()`** (#529), as the
   gpucontext v0.31 `DeviceProvider` requires; both return zero values.
 

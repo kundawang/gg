@@ -157,6 +157,13 @@
 //   - Efficient resource deduplication via pooling
 //   - Fast playback with direct command dispatch
 //
+// HUD-style exports can emit long runs of redundant state commands. Use
+// [Compress] (or [Recorder.SetCompressionEnabled]) to fold adjacent
+// transform, style and ClearClip commands down to the last write per state
+// slot. Compression never crosses Save/Restore, clip-set or drawing
+// boundaries, never touches the resource pool, and preserves Playback pixels;
+// [CompressionStats] explains every removed and retained command.
+//
 // For real-time rendering, prefer direct gg.Context usage. Use recording
 // when you need vector export or command inspection.
 package recording

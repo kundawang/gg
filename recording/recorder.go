@@ -51,6 +51,11 @@ type Recorder struct {
 
 	// State stack
 	stateStack []recorderState
+
+	// compressEnabled makes FinishRecording return a compressed recording.
+	// Off by default so the recorded command stream stays byte-for-byte
+	// stable unless compression is explicitly requested.
+	compressEnabled bool
 }
 
 // recorderState stores the graphics state for Save/Restore.
@@ -95,15 +100,34 @@ func NewRecorder(width, height int) *Recorder {
 	}
 }
 
+// SetCompressionEnabled toggles command compression for the recording
+// returned by [Recorder.FinishRecording]. It is the Recorder-side
+// compatibility entry point: callers that need the exact original command
+// stream leave compression disabled (the default).
+func (r *Recorder) SetCompressionEnabled(enabled bool) {
+	r.compressEnabled = enabled
+}
+
 // FinishRecording returns an immutable Recording containing all recorded commands.
 // After calling FinishRecording, the Recorder should not be used again.
+//
+// When compression has been enabled with
+// [Recorder.SetCompressionEnabled], the returned recording contains the
+// compressed command stream; see the package-level [Compress] function for
+// the merging rules and guarantees. The Recorder retains the original
+// commands, so calling FinishRecording multiple times stays deterministic.
 func (r *Recorder) FinishRecording() *Recording {
-	return &Recording{
+	recording := &Recording{
 		width:     r.width,
 		height:    r.height,
 		commands:  r.commands,
 		resources: r.resources,
 	}
+	if !r.compressEnabled {
+		return recording
+	}
+	compressed, _ := Compress(recording, CompressOptions{Enabled: true})
+	return compressed
 }
 
 // Recording is an immutable container for recorded drawing commands.
