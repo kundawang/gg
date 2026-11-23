@@ -432,6 +432,13 @@ type Encoding struct {
 	// Used by DamageTracker for frame-to-frame object diff.
 	commandBounds []Rect
 
+	// layerExpand tracks the per-side bounds growth contributed by filters on
+	// each layer, parallel to the TagPushLayer tags in stream order. It is a
+	// side table — no bytes are added to the render streams — and is consumed by
+	// hit testing so filter output (blur, drop shadow) is pickable. Entries are
+	// merged by Append/AppendWithTranslation and copied by Clone.
+	layerExpand []Rect
+
 	// bounds tracks cumulative bounding box
 	bounds Rect
 
@@ -468,6 +475,7 @@ func (e *Encoding) Reset() {
 	e.textData = e.textData[:0]
 	e.brushes = e.brushes[:0]
 	e.commandBounds = e.commandBounds[:0]
+	e.layerExpand = e.layerExpand[:0]
 	e.bounds = EmptyRect()
 	e.pathBounds = EmptyRect()
 	e.pathCount = 0
@@ -620,6 +628,22 @@ func (e *Encoding) EncodePushLayer(blend BlendMode, alpha float32) {
 	e.tags = append(e.tags, TagPushLayer)
 	e.drawData = append(e.drawData, uint32(blend))
 	e.drawData = append(e.drawData, math.Float32bits(alpha))
+	e.layerExpand = append(e.layerExpand, Rect{})
+}
+
+// EncodePushLayerExpanded pushes a new compositing layer whose painted content
+// (including filter output such as blur or drop shadow) grows by the given
+// per-side expansion. The expansion is recorded in a side table used by hit
+// testing; it does not change the render streams or their Hash.
+func (e *Encoding) EncodePushLayerExpanded(blend BlendMode, alpha float32, expand Rect) {
+	e.EncodePushLayer(blend, alpha)
+	e.layerExpand[len(e.layerExpand)-1] = expand
+}
+
+// LayerExpand returns the per-side expansion recorded for each TagPushLayer, in
+// stream order. The returned slice is read-only and must not be modified.
+func (e *Encoding) LayerExpand() []Rect {
+	return e.layerExpand
 }
 
 // EncodePopLayer pops the current compositing layer.
@@ -885,6 +909,10 @@ func (e *Encoding) AppendWithImages(other *Encoding, imageOffset uint32) {
 	// Append brushes
 	e.brushes = append(e.brushes, other.brushes...)
 
+	// Append per-layer filter expansion (side table, order-matched to the
+	// TagPushLayer tags just appended).
+	e.layerExpand = append(e.layerExpand, other.layerExpand...)
+
 	// Union bounds
 	e.bounds = e.bounds.Union(other.bounds)
 
@@ -1044,6 +1072,9 @@ func (e *Encoding) AppendWithTranslation(other *Encoding, dx, dy float32, imageO
 
 	e.brushes = append(e.brushes, other.brushes...)
 
+	// Per-layer filter expansion travels unchanged with the layer tags.
+	e.layerExpand = append(e.layerExpand, other.layerExpand...)
+
 	ob := other.bounds
 	ob.MinX += dx
 	ob.MinY += dy
@@ -1106,6 +1137,9 @@ func (e *Encoding) Clone() *Encoding {
 	clone.brushes = make([]Brush, len(e.brushes))
 	copy(clone.brushes, e.brushes)
 
+	clone.layerExpand = make([]Rect, len(e.layerExpand))
+	copy(clone.layerExpand, e.layerExpand)
+
 	clone.bounds = e.bounds
 	clone.pathBounds = e.pathBounds
 	clone.pathCount = e.pathCount
@@ -1161,7 +1195,8 @@ func (e *Encoding) Size() int {
 		len(e.drawData)*4 +
 		len(e.textData) +
 		len(e.transforms)*24 + // 6 float32 per Affine
-		len(e.brushes)*20 // approximate brush size
+		len(e.brushes)*20 + // approximate brush size
+		len(e.layerExpand)*16 // 4 float32 per Rect (filter side table)
 }
 
 // Capacity returns the total allocated capacity in bytes.

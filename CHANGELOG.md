@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Scene hit testing** — `scene.HitTester`, `Encoding.HitTest`/`HitTestAll`, and
+  `Scene.HitTest`/`HitTestAll` (with `...WithOptions`) return the topmost or all
+  draw commands under a point, in reverse draw order, without touching the
+  renderer or the encoding. Hits carry a stable command ID (the draw tag's
+  index, same ID space as `TaggedBounds`), the hit kind, the command's
+  parent-space bounds and the query point mapped back into the command's local
+  space through the inverse of its transform. Fill rule (non-zero / even-odd),
+  stroke width / cap / join / miter (via the renderer's own stroke expander,
+  with transform-scaled width and hairline parity), image rectangles with
+  transparent-pixel rejection, and pre-shaped text glyph boxes are honored;
+  clips and filter-expanded layer bounds participate; `Scene.SetOrigin` makes
+  queries relative to a non-zero scene origin. Tangency counts as a hit, empty
+  and MoveTo-only paths never hit. Non-finite points, singular transforms,
+  unbalanced or truncated streams and deeply nested clip/layer structures never
+  panic, and queries are safe to run concurrently and never mutate the encoding,
+  its caches or command order.
+- **`Scene.PushLayerFiltered`** records an optional filter chain on a layer.
+  Expansion-only filters (blur, drop shadow) grow that layer's hit region by
+  their `ExpandBounds` output while the layer is open, stored in an `Encoding`
+  side table (`Encoding.LayerExpand`) that is merged by `Append` /
+  `AppendWithTranslation` and copied by `Clone` without altering the render
+  streams or their `Hash`.
+- **`Scene.SetOrigin` / `Scene.Origin`** — the scene's position in parent space,
+  used only by hit testing; geometry, bounds, rendering and encoding are
+  unchanged.
+
 ## [0.52.5] - 2026-08-26
 
 ### Fixed

@@ -73,6 +73,11 @@ type LayerState struct {
 	// ClipStackDepth records the clip stack depth when layer was pushed.
 	// Used to restore clip state on pop.
 	ClipStackDepth int
+
+	// Filter is an optional filter chain applied to this layer's content on
+	// pop. Filters that expand output (blur, drop shadow) also expand the
+	// layer's hit region so the visible effect is pickable.
+	Filter *FilterChain
 }
 
 // NewLayerState creates a new layer state with default values.
@@ -124,6 +129,7 @@ func (ls *LayerState) Reset() {
 	ls.Bounds = EmptyRect()
 	ls.Transform = IdentityAffine()
 	ls.ClipStackDepth = 0
+	ls.Filter = nil
 }
 
 // UpdateBounds expands the layer bounds to include the given rectangle.

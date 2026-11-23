@@ -369,6 +369,18 @@ gpuR := scene.NewGPUSceneRenderer(dc)
 gpuR.RenderScene(s)
 ```
 
+Hit testing for editors and interaction — topmost or all commands under a
+point, in reverse draw order, with local coordinates and no mutation of the
+scene:
+
+```go
+hit := s.HitTest(pointerX, pointerY)
+if hit != nil {
+    fmt.Println(hit.ID, hit.Kind, hit.LocalX, hit.LocalY, hit.Bounds)
+}
+all := s.HitTestAll(pointerX, pointerY) // topmost first
+```
+
 ### Text Rendering
 
 Full Unicode support with font fallback and built-in GSUB/GPOS shaping:

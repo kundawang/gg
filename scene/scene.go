@@ -66,6 +66,11 @@ type Scene struct {
 	// pathPool reuses Path objects to avoid per-shape allocations in Fill/Stroke.
 	// Each shape.ToPath() creates a new Path; pooling eliminates this overhead.
 	pathPool PathPool
+
+	// origin is where scene coordinates sit in parent/document space. It is
+	// subtracted from hit-test query points (see Scene.HitTest). Zero by
+	// default, so scene coordinates equal parent coordinates.
+	origin [2]float32
 }
 
 // NewScene creates a new empty scene.
@@ -100,6 +105,27 @@ func (s *Scene) Reset() {
 	s.lastEncodedAA = true
 	s.imageRegistry = s.imageRegistry[:0]
 	clear(s.fontRegistry)
+	s.origin = [2]float32{}
+}
+
+// SetOrigin records where scene coordinates sit in the parent/document space
+// used by the host, such as a canvas inside a scrollable window. It affects hit
+// testing only: recorded geometry, bounds, rendering and the encoding are
+// unchanged. SetOrigin(0, 0) is the default.
+func (s *Scene) SetOrigin(x, y float32) {
+	s.origin = [2]float32{x, y}
+	s.version++
+}
+
+// Origin returns the scene origin set by SetOrigin.
+func (s *Scene) Origin() (x, y float32) {
+	return s.origin[0], s.origin[1]
+}
+
+// SceneOrigin returns the scene origin as a readable pair. It is a convenience
+// for callers that prefer a value over two returns.
+func (s *Scene) SceneOrigin() [2]float32 {
+	return s.origin
 }
 
 // SetAntiAlias enables or disables anti-aliasing for subsequent fill and stroke
@@ -305,15 +331,28 @@ func (s *Scene) DrawImage(img *Image, transform Affine) {
 // All subsequent drawing operations will be rendered to this layer.
 // Call PopLayer to composite the layer with the content below.
 func (s *Scene) PushLayer(blend BlendMode, alpha float32, clip Shape) {
+	s.PushLayerFiltered(blend, alpha, clip, nil)
+}
+
+// PushLayerFiltered pushes a new compositing layer with an optional filter
+// chain. Filters that expand output (blur, drop shadow) grow the layer's hit
+// region by their expanded bounds while the layer is open, so blurred edges and
+// shadows are pickable. The expansion is recorded in an encoding side table and
+// does not alter the render streams.
+func (s *Scene) PushLayerFiltered(blend BlendMode, alpha float32, clip Shape, filter *FilterChain) {
 	clampedAlpha := clampAlpha(alpha)
 
 	layer := s.layerStack.AcquireLayer()
 	layer.Kind = LayerRegular
+	if filter != nil && !filter.IsEmpty() {
+		layer.Kind = LayerFiltered
+	}
 	layer.BlendMode = blend
 	layer.Alpha = clampedAlpha
 	layer.Clip = clip
 	layer.Transform = s.currentTransform
 	layer.ClipStackDepth = s.clipStack.Depth()
+	layer.Filter = filter
 
 	// Initialize layer encoding
 	if layer.Encoding == nil {
@@ -322,9 +361,16 @@ func (s *Scene) PushLayer(blend BlendMode, alpha float32, clip Shape) {
 		layer.Encoding.Reset()
 	}
 
-	// Encode push layer in parent
+	// Encode push layer in parent. Filter expansion is expressed in the
+	// layer's coordinate space, which is the space of the content drawn into
+	// it (currentTransform is already baked into that content).
 	parentEnc := s.currentEncoding()
-	parentEnc.EncodePushLayer(blend, clampedAlpha)
+	var expand Rect
+	if filter != nil && !filter.IsEmpty() {
+		zero := Rect{MinX: 0, MinY: 0, MaxX: 0, MaxY: 0}
+		expand = filter.ExpandBounds(zero)
+	}
+	parentEnc.EncodePushLayerExpanded(blend, clampedAlpha, expand)
 
 	// If there's a clip, encode it
 	if clip != nil {
