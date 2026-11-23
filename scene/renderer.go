@@ -150,9 +150,22 @@ type Renderer struct {
 	workerPool *parallel.WorkerPool
 	dirty      *parallel.DirtyRegion
 
-	// Layer caching
+	// Layer caching (legacy hash-based cache, retained for API compatibility)
 	cache *LayerCache
 
+	// pixelCache caches rasterized static layer pixmaps by full
+	// (layer, scale, filter) signatures. Nil unless enabled via
+	// WithLayerPixelCache / WithLayerCacheBudget.
+	pixelCache *LayerPixelCache
+
+	// deviceScale is the target device pixel ratio for layer rasterization.
+	// Layer entries are keyed by the quantized scale so different device
+	// scales never share a pixmap.
+	deviceScale float32
+
+	// layerFilters maps a top-level layer slot ID to its filter chain
+	// description (optional; nil for unfiltered layers).
+	layerFilters map[uint32][]FilterSpec
 	// Per-tile resource pool (SoftwareRenderer + Pixmap reuse)
 	pool tilePool
 
@@ -232,6 +245,50 @@ func WithCache(cache *LayerCache) RendererOption {
 	}
 }
 
+// WithLayerPixelCache enables signature-based layer pixel caching with an
+// explicitly constructed cache. A non-nil cache activates the layer-aware
+// render path; pass a zero-budget cache for a disabled-but-wired fallback.
+func WithLayerPixelCache(cache *LayerPixelCache) RendererOption {
+	return func(r *Renderer) {
+		r.pixelCache = cache
+	}
+}
+
+// WithLayerCacheBudget enables signature-based layer pixel caching with the
+// given byte budget. A budget <= 0 leaves the layer cache disabled.
+func WithLayerCacheBudget(maxBytes int64) RendererOption {
+	return func(r *Renderer) {
+		if maxBytes > 0 {
+			r.pixelCache = NewLayerPixelCache(maxBytes)
+		}
+	}
+}
+
+// WithDeviceScale sets the target device pixel ratio used for layer cache
+// signatures and layer rasterization. Non-positive values default to 1.0.
+// Changing the scale at runtime changes every layer key, so old-scale
+// entries age out through normal LRU eviction rather than being reused.
+func WithDeviceScale(scale float32) RendererOption {
+	return func(r *Renderer) {
+		if scale <= 0 {
+			scale = 1
+		}
+		r.deviceScale = QuantizeScale(scale)
+	}
+}
+
+// WithLayerFilter attaches a filter chain description to a top-level layer
+// slot (0 = first pushed layer). The filter hash becomes part of the layer's
+// cache signature; changing parameters therefore forces an exact rebuild.
+func WithLayerFilter(layerID uint32, specs ...FilterSpec) RendererOption {
+	return func(r *Renderer) {
+		if r.layerFilters == nil {
+			r.layerFilters = make(map[uint32][]FilterSpec)
+		}
+		r.layerFilters[layerID] = append([]FilterSpec(nil), specs...)
+	}
+}
+
 // NewRenderer creates a new scene renderer for the given dimensions.
 // Options can be used to configure caching, parallelism, and other settings.
 func NewRenderer(width, height int, opts ...RendererOption) *Renderer {
@@ -242,11 +299,12 @@ func NewRenderer(width, height int, opts ...RendererOption) *Renderer {
 	workers := runtime.GOMAXPROCS(0)
 
 	r := &Renderer{
-		width:    width,
-		height:   height,
-		tileSize: parallel.TileWidth,
-		workers:  workers,
-		cache:    DefaultLayerCache(),
+		width:       width,
+		height:      height,
+		tileSize:    parallel.TileWidth,
+		workers:     workers,
+		cache:       DefaultLayerCache(),
+		deviceScale: 1,
 	}
 
 	// Apply options
@@ -314,6 +372,16 @@ func (r *Renderer) RenderWithContext(ctx context.Context, target *gg.Pixmap, sce
 	// The gg.Context handles GPU→CPU fallback automatically per-shape.
 	if gg.Accelerator() != nil {
 		if err := r.renderGPU(target, scene); err == nil {
+			return nil
+		}
+	}
+
+	// Layer-cached CPU path: when a signature-based pixel cache is enabled,
+	// split static layers out, serve them from the cache, and render only
+	// the root content through the tile pipeline. Any unsupported scene
+	// shape falls back to the full tile path below.
+	if r.pixelCache != nil && r.pixelCache.Enabled() {
+		if rendered, err := r.renderWithLayerCache(ctx, target, scene); err == nil && rendered {
 			return nil
 		}
 	}
@@ -616,17 +684,24 @@ type tileClipState struct {
 
 // executeEncodingOnTile executes encoding commands on a single tile, delegating
 // rasterization to gg.SoftwareRenderer for analytic anti-aliased output.
+func (r *Renderer) executeEncodingOnTile(dec *Decoder, tile *parallel.Tile, pm *gg.Pixmap, sr *gg.SoftwareRenderer, images []*Image) {
+	tileX, tileY, _, _ := tile.Bounds()
+	r.executeEncodingAtOrigin(dec, pm, sr, images, tileX, tileY)
+}
+
+// executeEncodingAtOrigin runs the command interpreter into pm using an
+// explicit canvas-space origin. The tile pipeline passes its tile origin;
+// the layer cache passes arbitrary offscreen-buffer origins, which is why
+// the origin is a parameter rather than derived from a tile grid position.
 //
-//nolint:gocyclo,cyclop,gocognit,funlen // Command interpreter with multiple cases is inherently complex
-func (r *Renderer) executeEncodingOnTile(dec *Decoder, tile *parallel.Tile, pm *gg.Pixmap, sr *gg.SoftwareRenderer, images []*Image) { //nolint:maintidx // tag dispatch across all scene command types
+//nolint:gocyclo,cyclop,gocognit,funlen,maintidx // tag dispatch across all scene command types
+func (r *Renderer) executeEncodingAtOrigin(dec *Decoder, pm *gg.Pixmap, sr *gg.SoftwareRenderer, images []*Image, tileX, tileY int) {
 	// Reusable scene.Path for the decode loop — reset per TagBeginPath instead of allocating.
 	currentPath := r.pool.getScenePath()
 	defer r.pool.putScenePath(currentPath)
 	pathActive := false // true between TagBeginPath and fill/stroke/clip consume
 
 	currentTransform := IdentityAffine()
-
-	tileX, tileY, _, _ := tile.Bounds()
 
 	// activePM is the pixmap we currently render into. It starts as the tile
 	// pixmap but may be swapped to a temporary pixmap inside clip regions.
@@ -1199,7 +1274,8 @@ func blitImageToTile(img *Image, transform Affine, tileX, tileY int, pm *gg.Pixm
 // ix0, iy0 are the top-left texel coordinates; fx, fy are the fractional
 // bilinear weights in [0, 1).
 func blitBilinearPixel(imgData, pmData []byte, dstOff, imgStride,
-	ix0, iy0, maxSrcX, maxSrcY int, fx, fy float32) {
+	ix0, iy0, maxSrcX, maxSrcY int, fx, fy float32,
+) {
 	// Clamp coordinates to image bounds (clamp-to-edge, prevents seams).
 	cx0 := clampMax(ix0, maxSrcX)
 	cx1 := clampMax(ix0+1, maxSrcX)

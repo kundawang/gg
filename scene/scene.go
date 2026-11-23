@@ -776,6 +776,12 @@ type Image struct {
 	// Data holds the pixel data (RGBA format)
 	// This will be populated during integration phase
 	Data []byte
+
+	// version is a resource modification counter incremented by
+	// NotifyPixelsChanged. It participates in layer cache signatures so
+	// that pixel mutation invalidates every cached layer referencing this
+	// image, even when the encoding command stream itself is unchanged.
+	version uint64
 }
 
 // NewImage creates a new image with the given dimensions.
@@ -784,6 +790,19 @@ func NewImage(width, height int) *Image {
 		Width:  width,
 		Height: height,
 	}
+}
+
+// Version returns the resource modification version. It starts at zero and
+// is incremented each time NotifyPixelsChanged is called.
+func (img *Image) Version() uint64 {
+	return img.version
+}
+
+// NotifyPixelsChanged increments the resource version. Call this after
+// mutating Data in place so cached layers referencing the image are
+// invalidated on their next signature check.
+func (img *Image) NotifyPixelsChanged() {
+	img.version++
 }
 
 // Bounds returns the image bounds as a Rect.
