@@ -172,3 +172,41 @@ func (p *ResourcePool) Clone() *ResourcePool {
 
 	return clone
 }
+
+// --------------------------------------------------------------------------
+// Stream reader support
+// --------------------------------------------------------------------------
+
+// appendPathAt appends a path for a stream-defined resource, returning its
+// reference. Stream resource IDs are assigned in order, so append matches the
+// ID the writer used.
+func (p *ResourcePool) appendPathAt(path *gg.Path) PathRef {
+	if path != nil {
+		// Clone to keep the recording immutable, matching AddPath.
+		path = path.Clone()
+	}
+	p.paths = append(p.paths, path)
+	// #nosec G115 -- pool size is bounded by available memory, well under uint32 max
+	return PathRef(uint32(len(p.paths) - 1))
+}
+
+// appendBrushAt appends a decoded brush.
+func (p *ResourcePool) appendBrushAt(brush Brush) BrushRef {
+	p.brushes = append(p.brushes, brush)
+	// #nosec G115 -- pool size is bounded by available memory, well under uint32 max
+	return BrushRef(uint32(len(p.brushes) - 1))
+}
+
+// appendImageAt appends a decoded image.
+func (p *ResourcePool) appendImageAt(img image.Image) ImageRef {
+	p.images = append(p.images, img)
+	// #nosec G115 -- pool size is bounded by available memory, well under uint32 max
+	return ImageRef(uint32(len(p.images) - 1))
+}
+
+// appendFontAt appends a decoded font face.
+func (p *ResourcePool) appendFontAt(face text.Face) FontRef {
+	p.fonts = append(p.fonts, face)
+	// #nosec G115 -- pool size is bounded by available memory, well under uint32 max
+	return FontRef(uint32(len(p.fonts) - 1))
+}

@@ -159,4 +159,45 @@
 //
 // For real-time rendering, prefer direct gg.Context usage. Use recording
 // when you need vector export or command inspection.
+//
+// # Streaming
+//
+// For long recordings — animation, screen capture, large scenes — the whole
+// command list need not live in memory. [Recorder.StreamTo] attaches a
+// recorder to any io.Writer; every subsequent command (and the resources it
+// references) is framed and written as it is recorded. [StreamReader] consumes
+// the same byte stream incrementally from any io.Reader and can either replay
+// it to a [Backend] as commands arrive via [StreamReader.Playback] (constant
+// memory) or assemble a complete [Recording] via [StreamReader.ReadAll].
+//
+//	// Producer (recording, one process)
+//	rec := recording.NewRecorder(1920, 1080)
+//	sw, _ := rec.StreamTo(pipeWriter, nil)
+//	// ... record a frame ...
+//	sw.Finish()
+//
+//	// Consumer (playing back, another process)
+//	sr := recording.NewStreamReader(pipeReader, nil)
+//	sr.Playback(backend) // renders while the producer is still recording
+//
+// The wire format is versioned, byte-order tagged, and length-delimited:
+//
+//   - Every frame begins with a 16-byte header: magic "GGRS", a uint16
+//     version, an endianness tag, a frame kind, the payload length, and a
+//     CRC-32C of the payload.
+//   - The first frame is a canvas frame; resource frames define paths,
+//     brushes, images, and fonts by explicit ID; command frames carry one
+//     drawing command; the final end frame carries resource/command totals
+//     and a running checksum over the whole stream.
+//   - Multi-byte scalars use the declared byte order, so a big-endian producer
+//     is readable on a little-endian host and vice versa.
+//
+// Readers validate the header, payload length (against [StreamConfig]
+// MaxFrameSize), and checksum before interpreting any bytes, and bounds every
+// length read from a payload against the remaining frame bytes. Truncation,
+// unknown tags, oversized lengths, duplicate resource definitions, references
+// to resources not yet defined, and unfinished streams all return a
+// [*StreamError] carrying the chunk (frame) number, the command number where
+// applicable, and the byte offset. Corruption cannot cause an unbounded
+// allocation or a panic.
 package recording

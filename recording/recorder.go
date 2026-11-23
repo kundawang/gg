@@ -2,6 +2,7 @@ package recording
 
 import (
 	"image"
+	"io"
 	"math"
 	"strings"
 
@@ -51,6 +52,35 @@ type Recorder struct {
 
 	// State stack
 	stateStack []recorderState
+
+	// stream, when non-nil, receives commands as they are recorded so a long
+	// recording can be consumed without retaining every command in memory.
+	stream *StreamWriter
+}
+
+// emit appends a command to the in-memory recording. When the recorder is
+// attached to a stream, the command is also written to the stream first,
+// which emits any resources the command depends on. The in-memory slice is
+// still populated so FinishRecording produces a complete recording; callers
+// that want constant memory use StreamTo and discard the Recorder afterward.
+func (r *Recorder) emit(cmd Command) error {
+	if r.stream != nil {
+		if err := r.stream.syncResources(r.resources); err != nil {
+			return err
+		}
+		if err := r.stream.emitCommand(cmd); err != nil {
+			return err
+		}
+	}
+	r.commands = append(r.commands, cmd)
+	return nil
+}
+
+// mustEmit is emit for code paths that cannot surface an error. A stream
+// failure is latched on the StreamWriter; the recorder stays consistent and
+// the caller observes the error from StreamWriter.Finish or StreamWriter.Err.
+func (r *Recorder) mustEmit(cmd Command) {
+	_ = r.emit(cmd)
 }
 
 // recorderState stores the graphics state for Save/Restore.
@@ -106,6 +136,51 @@ func (r *Recorder) FinishRecording() *Recording {
 	}
 }
 
+// StreamTo attaches the recorder to w and returns the StreamWriter that
+// receives every subsequent command. The canvas frame is written immediately;
+// commands and the resources they reference are written as they are recorded.
+//
+// While streaming, the recorder still builds its in-memory command slice so
+// FinishRecording remains valid. To bound memory on a long recording, call
+// Reset to drop the accumulated commands after you no longer need them, or
+// drive the stream through Recording.StreamTo instead.
+//
+// Use Finish to write the end frame. StreamTo returns ErrAlreadyStreaming if
+// the recorder is already attached to a different writer.
+func (r *Recorder) StreamTo(w io.Writer, cfg *StreamConfig) (*StreamWriter, error) {
+	sw := NewStreamWriter(w, cfg)
+	if err := sw.attach(r); err != nil {
+		return nil, err
+	}
+	// Flush everything recorded before the attach so streaming a recording
+	// created earlier produces the same stream as recording into it directly.
+	if err := sw.syncResources(r.resources); err != nil {
+		return nil, err
+	}
+	for _, cmd := range r.commands {
+		if err := sw.emitCommand(cmd); err != nil {
+			return nil, err
+		}
+	}
+	r.stream = sw
+	return sw, nil
+}
+
+// Reset drops all in-memory commands and resources accumulated so far while
+// keeping the recorder attached to its stream. Use it in a streaming loop to
+// keep memory bounded; the stream retains everything already written.
+//
+// Reset must not be called between the time a path is submitted to Fill,
+// Stroke, or Clip and the command that consumes it; it only clears already
+// recorded commands and pooled resources, and the current path is preserved.
+func (r *Recorder) Reset() {
+	r.commands = r.commands[:0]
+	r.resources.Clear()
+	if r.stream != nil {
+		r.stream.resetResourceCursor()
+	}
+}
+
 // Recording is an immutable container for recorded drawing commands.
 // It can be replayed to any Backend implementation.
 type Recording struct {
@@ -136,8 +211,15 @@ func (r *Recording) Resources() *ResourcePool {
 
 // Playback replays the recording to the given backend.
 func (r *Recording) Playback(backend Backend) error {
+	return playbackCommands(r.width, r.height, r.commands, r.resources, backend)
+}
+
+// playbackCommands replays commands against resources to a backend. It is
+// shared by Recording.Playback and StreamPlayback so both paths apply every
+// command identically.
+func playbackCommands(width, height int, commands []Command, resources *ResourcePool, backend Backend) error {
 	// Initialize backend
-	if err := backend.Begin(r.width, r.height); err != nil {
+	if err := backend.Begin(width, height); err != nil {
 		return err
 	}
 
@@ -145,7 +227,7 @@ func (r *Recording) Playback(backend Backend) error {
 	transformStack := make([]Matrix, 0, 8)
 
 	// Replay each command
-	for _, cmd := range r.commands {
+	for _, cmd := range commands {
 		switch c := cmd.(type) {
 		case SaveCommand:
 			transformStack = append(transformStack, transform)
@@ -160,7 +242,7 @@ func (r *Recording) Playback(backend Backend) error {
 			transform = c.Matrix
 			backend.SetTransform(c.Matrix)
 		case SetClipCommand:
-			path := r.resources.GetPath(c.Path)
+			path := resources.GetPath(c.Path)
 			setPlaybackClip(backend, path, c.Rule, transform)
 		case ClearClipCommand:
 			backend.ClearClip()
@@ -168,19 +250,19 @@ func (r *Recording) Playback(backend Backend) error {
 			rrPath := buildClipRoundRectPath(c, transform)
 			setPlaybackClip(backend, rrPath, FillRuleNonZero, transform)
 		case FillPathCommand:
-			path := r.resources.GetPath(c.Path)
-			brush := r.resources.GetBrush(c.Brush)
+			path := resources.GetPath(c.Path)
+			brush := resources.GetBrush(c.Brush)
 			backend.FillPath(path, brush, c.Rule)
 		case StrokePathCommand:
-			path := r.resources.GetPath(c.Path)
-			brush := r.resources.GetBrush(c.Brush)
+			path := resources.GetPath(c.Path)
+			brush := resources.GetBrush(c.Brush)
 			backend.StrokePath(path, brush, c.Stroke)
 		case FillRectCommand:
-			brush := r.resources.GetBrush(c.Brush)
+			brush := resources.GetBrush(c.Brush)
 			backend.FillRect(c.Rect, brush)
 		case StrokeRectCommand:
-			brush := r.resources.GetBrush(c.Brush)
-			path := gg.BuildPath().Rect(c.Rect.MinX, c.Rect.MinY, c.Rect.Width(), c.Rect.Height()).Build()
+			brush := resources.GetBrush(c.Brush)
+			path := buildRectPath(c.Rect)
 			// StrokeRectCommand stores world-space bounds. Isolate the identity
 			// transform so backends do not apply the recording transform twice,
 			// then restore their complete graphics state for later commands.
@@ -189,13 +271,13 @@ func (r *Recording) Playback(backend Backend) error {
 			backend.StrokePath(path, brush, c.Stroke)
 			backend.Restore()
 		case DrawImageCommand:
-			img := r.resources.GetImage(c.Image)
+			img := resources.GetImage(c.Image)
 			backend.DrawImage(img, c.SrcRect, c.DstRect, c.Options)
 		case DrawTextCommand:
-			brush := r.resources.GetBrush(c.Brush)
+			brush := resources.GetBrush(c.Brush)
 			backend.DrawText(c.Text, c.X, c.Y, c.Face, brush)
 		case StrokeTextCommand:
-			brush := r.resources.GetBrush(c.Brush)
+			brush := resources.GetBrush(c.Brush)
 			backend.DrawText(c.Text, c.X, c.Y, c.Face, brush)
 		// Style commands are handled by the backend's internal state
 		// during the actual drawing operations
@@ -312,7 +394,7 @@ func (r *Recorder) Save() {
 		fontSize:    r.fontSize,
 	})
 
-	r.commands = append(r.commands, SaveCommand{})
+	r.mustEmit(SaveCommand{})
 }
 
 // Restore restores the previously saved graphics state.
@@ -340,7 +422,7 @@ func (r *Recorder) Restore() {
 	r.fontFamily = state.fontFamily
 	r.fontSize = state.fontSize
 
-	r.commands = append(r.commands, RestoreCommand{})
+	r.mustEmit(RestoreCommand{})
 }
 
 // Push is an alias for Save, matching gg.Context API.
@@ -360,25 +442,25 @@ func (r *Recorder) Pop() {
 // Identity resets the transformation matrix to identity.
 func (r *Recorder) Identity() {
 	r.transform = Identity()
-	r.commands = append(r.commands, SetTransformCommand{Matrix: r.transform})
+	r.mustEmit(SetTransformCommand{Matrix: r.transform})
 }
 
 // Translate applies a translation to the transformation matrix.
 func (r *Recorder) Translate(x, y float64) {
 	r.transform = r.transform.Multiply(Translate(x, y))
-	r.commands = append(r.commands, SetTransformCommand{Matrix: r.transform})
+	r.mustEmit(SetTransformCommand{Matrix: r.transform})
 }
 
 // Scale applies a scaling transformation.
 func (r *Recorder) Scale(sx, sy float64) {
 	r.transform = r.transform.Multiply(Scale(sx, sy))
-	r.commands = append(r.commands, SetTransformCommand{Matrix: r.transform})
+	r.mustEmit(SetTransformCommand{Matrix: r.transform})
 }
 
 // Rotate applies a rotation (angle in radians).
 func (r *Recorder) Rotate(angle float64) {
 	r.transform = r.transform.Multiply(Rotate(angle))
-	r.commands = append(r.commands, SetTransformCommand{Matrix: r.transform})
+	r.mustEmit(SetTransformCommand{Matrix: r.transform})
 }
 
 // RotateAbout rotates around a specific point.
@@ -405,19 +487,19 @@ func (r *Recorder) ShearAbout(sx, sy, x, y float64) {
 // Shear applies a shear transformation.
 func (r *Recorder) Shear(x, y float64) {
 	r.transform = r.transform.Multiply(Shear(x, y))
-	r.commands = append(r.commands, SetTransformCommand{Matrix: r.transform})
+	r.mustEmit(SetTransformCommand{Matrix: r.transform})
 }
 
 // Transform multiplies the current transformation matrix by the given matrix.
 func (r *Recorder) Transform(m Matrix) {
 	r.transform = r.transform.Multiply(m)
-	r.commands = append(r.commands, SetTransformCommand{Matrix: r.transform})
+	r.mustEmit(SetTransformCommand{Matrix: r.transform})
 }
 
 // SetTransform replaces the current transformation matrix.
 func (r *Recorder) SetTransform(m Matrix) {
 	r.transform = m
-	r.commands = append(r.commands, SetTransformCommand{Matrix: r.transform})
+	r.mustEmit(SetTransformCommand{Matrix: r.transform})
 }
 
 // GetTransform returns a copy of the current transformation matrix.
@@ -446,9 +528,8 @@ func (r *Recorder) SetColor(c gg.RGBA) {
 	r.fillBrush = brush
 	r.strokeBrush = brush
 	brushRef := r.resources.AddBrush(brush)
-	r.commands = append(r.commands,
-		SetFillStyleCommand{Brush: brushRef},
-		SetStrokeStyleCommand{Brush: brushRef})
+	r.mustEmit(SetFillStyleCommand{Brush: brushRef})
+	r.mustEmit(SetStrokeStyleCommand{Brush: brushRef})
 }
 
 // SetRGB sets both fill and stroke color using RGB values (0-1).
@@ -470,14 +551,14 @@ func (r *Recorder) SetHexColor(hex string) {
 func (r *Recorder) SetFillStyle(brush Brush) {
 	r.fillBrush = brush
 	brushRef := r.resources.AddBrush(brush)
-	r.commands = append(r.commands, SetFillStyleCommand{Brush: brushRef})
+	r.mustEmit(SetFillStyleCommand{Brush: brushRef})
 }
 
 // SetStrokeStyle sets the stroke brush.
 func (r *Recorder) SetStrokeStyle(brush Brush) {
 	r.strokeBrush = brush
 	brushRef := r.resources.AddBrush(brush)
-	r.commands = append(r.commands, SetStrokeStyleCommand{Brush: brushRef})
+	r.mustEmit(SetStrokeStyleCommand{Brush: brushRef})
 }
 
 // SetFillBrush sets the fill brush from a gg.Brush.
@@ -517,13 +598,13 @@ func (r *Recorder) SetStrokeRGBA(red, green, blue, alpha float64) {
 // SetLineWidth sets the line width for stroking.
 func (r *Recorder) SetLineWidth(width float64) {
 	r.lineWidth = width
-	r.commands = append(r.commands, SetLineWidthCommand{Width: width})
+	r.mustEmit(SetLineWidthCommand{Width: width})
 }
 
 // SetLineCap sets the line cap style.
 func (r *Recorder) SetLineCap(lc LineCap) {
 	r.lineCap = lc
-	r.commands = append(r.commands, SetLineCapCommand{Cap: lc})
+	r.mustEmit(SetLineCapCommand{Cap: lc})
 }
 
 // SetLineCapGG sets the line cap style from gg.LineCap.
@@ -535,7 +616,7 @@ func (r *Recorder) SetLineCapGG(lc gg.LineCap) {
 // SetLineJoin sets the line join style.
 func (r *Recorder) SetLineJoin(join LineJoin) {
 	r.lineJoin = join
-	r.commands = append(r.commands, SetLineJoinCommand{Join: join})
+	r.mustEmit(SetLineJoinCommand{Join: join})
 }
 
 // SetLineJoinGG sets the line join style from gg.LineJoin.
@@ -547,7 +628,7 @@ func (r *Recorder) SetLineJoinGG(join gg.LineJoin) {
 // SetMiterLimit sets the miter limit for line joins.
 func (r *Recorder) SetMiterLimit(limit float64) {
 	r.miterLimit = limit
-	r.commands = append(r.commands, SetMiterLimitCommand{Limit: limit})
+	r.mustEmit(SetMiterLimitCommand{Limit: limit})
 }
 
 // SetDash sets the dash pattern for stroking.
@@ -561,14 +642,14 @@ func (r *Recorder) SetDash(lengths ...float64) {
 
 	r.dashPattern = make([]float64, len(lengths))
 	copy(r.dashPattern, lengths)
-	r.commands = append(r.commands, SetDashCommand{Pattern: r.dashPattern, Offset: r.dashOffset})
+	r.mustEmit(SetDashCommand{Pattern: r.dashPattern, Offset: r.dashOffset})
 }
 
 // SetDashOffset sets the starting offset into the dash pattern.
 func (r *Recorder) SetDashOffset(offset float64) {
 	r.dashOffset = offset
 	if r.dashPattern != nil {
-		r.commands = append(r.commands, SetDashCommand{Pattern: r.dashPattern, Offset: r.dashOffset})
+		r.mustEmit(SetDashCommand{Pattern: r.dashPattern, Offset: r.dashOffset})
 	}
 }
 
@@ -576,13 +657,13 @@ func (r *Recorder) SetDashOffset(offset float64) {
 func (r *Recorder) ClearDash() {
 	r.dashPattern = nil
 	r.dashOffset = 0
-	r.commands = append(r.commands, SetDashCommand{Pattern: nil, Offset: 0})
+	r.mustEmit(SetDashCommand{Pattern: nil, Offset: 0})
 }
 
 // SetFillRule sets the fill rule.
 func (r *Recorder) SetFillRule(rule FillRule) {
 	r.fillRule = rule
-	r.commands = append(r.commands, SetFillRuleCommand{Rule: rule})
+	r.mustEmit(SetFillRuleCommand{Rule: rule})
 }
 
 // SetFillRuleGG sets the fill rule from gg.FillRule.
@@ -595,7 +676,7 @@ func (r *Recorder) SetFillRuleGG(rule gg.FillRule) {
 // When disabled, shapes are rendered with binary coverage (no gray edge pixels).
 func (r *Recorder) SetAntiAlias(enabled bool) {
 	r.antiAlias = enabled
-	r.commands = append(r.commands, SetAntiAliasCommand{Enabled: enabled})
+	r.mustEmit(SetAntiAliasCommand{Enabled: enabled})
 }
 
 // AntiAlias returns whether anti-aliasing is enabled.
@@ -663,7 +744,7 @@ func (r *Recorder) Fill() {
 	pathRef := r.resources.AddPath(r.currentPath)
 	brushRef := r.resources.AddBrush(r.fillBrush)
 
-	r.commands = append(r.commands, FillPathCommand{
+	r.mustEmit(FillPathCommand{
 		Path:  pathRef,
 		Brush: brushRef,
 		Rule:  r.fillRule,
@@ -681,7 +762,7 @@ func (r *Recorder) FillPreserve() {
 	pathRef := r.resources.AddPath(r.currentPath)
 	brushRef := r.resources.AddBrush(r.fillBrush)
 
-	r.commands = append(r.commands, FillPathCommand{
+	r.mustEmit(FillPathCommand{
 		Path:  pathRef,
 		Brush: brushRef,
 		Rule:  r.fillRule,
@@ -706,7 +787,7 @@ func (r *Recorder) Stroke() {
 		DashOffset:  r.dashOffset,
 	}
 
-	r.commands = append(r.commands, StrokePathCommand{
+	r.mustEmit(StrokePathCommand{
 		Path:   pathRef,
 		Brush:  brushRef,
 		Stroke: stroke,
@@ -733,7 +814,7 @@ func (r *Recorder) StrokePreserve() {
 		DashOffset:  r.dashOffset,
 	}
 
-	r.commands = append(r.commands, StrokePathCommand{
+	r.mustEmit(StrokePathCommand{
 		Path:   pathRef,
 		Brush:  brushRef,
 		Stroke: stroke,
@@ -884,7 +965,7 @@ func (r *Recorder) DrawEllipticalArc(x, y, rx, ry, angle1, angle2 float64) {
 		r.fillRule = state.fillRule
 		r.transform = state.transform
 	}
-	r.commands = append(r.commands, RestoreCommand{})
+	r.mustEmit(RestoreCommand{})
 }
 
 // --------------------------------------------------------------------------
@@ -901,7 +982,7 @@ func (r *Recorder) FillRectangle(x, y, w, h float64) {
 	rect := NewRectFromPoints(x1, y1, x2, y2)
 	brushRef := r.resources.AddBrush(r.fillBrush)
 
-	r.commands = append(r.commands, FillRectCommand{
+	r.mustEmit(FillRectCommand{
 		Rect:  rect,
 		Brush: brushRef,
 	})
@@ -958,12 +1039,10 @@ func (r *Recorder) StrokeRectangle(x, y, w, h float64) {
 
 		// Isolate identity around the world-space path so every backend applies
 		// its coordinates and captured stroke metrics exactly once.
-		r.commands = append(r.commands,
-			SaveCommand{},
-			SetTransformCommand{Matrix: Identity()},
-			StrokePathCommand{Path: pathRef, Brush: brushRef, Stroke: stroke},
-			RestoreCommand{},
-		)
+		r.mustEmit(SaveCommand{})
+		r.mustEmit(SetTransformCommand{Matrix: Identity()})
+		r.mustEmit(StrokePathCommand{Path: pathRef, Brush: brushRef, Stroke: stroke})
+		r.mustEmit(RestoreCommand{})
 		return
 	}
 
@@ -973,7 +1052,7 @@ func (r *Recorder) StrokeRectangle(x, y, w, h float64) {
 	x2, y2 := r.transform.TransformPoint(x+w, y+h)
 	rect := NewRectFromPoints(x1, y1, x2, y2)
 
-	r.commands = append(r.commands, StrokeRectCommand{
+	r.mustEmit(StrokeRectCommand{
 		Rect:   rect,
 		Brush:  brushRef,
 		Stroke: stroke,
@@ -991,7 +1070,7 @@ func (r *Recorder) Clip() {
 	}
 
 	pathRef := r.resources.AddPath(r.currentPath)
-	r.commands = append(r.commands, SetClipCommand{
+	r.mustEmit(SetClipCommand{
 		Path: pathRef,
 		Rule: r.fillRule,
 	})
@@ -1006,7 +1085,7 @@ func (r *Recorder) ClipPreserve() {
 	}
 
 	pathRef := r.resources.AddPath(r.currentPath)
-	r.commands = append(r.commands, SetClipCommand{
+	r.mustEmit(SetClipCommand{
 		Path: pathRef,
 		Rule: r.fillRule,
 	})
@@ -1014,13 +1093,13 @@ func (r *Recorder) ClipPreserve() {
 
 // ResetClip removes all clipping regions.
 func (r *Recorder) ResetClip() {
-	r.commands = append(r.commands, ClearClipCommand{})
+	r.mustEmit(ClearClipCommand{})
 }
 
 // ClipRoundRect sets a rounded rectangle as the clipping region.
 // The rectangle is defined in user-space coordinates with uniform corner radius.
 func (r *Recorder) ClipRoundRect(x, y, w, h, radius float64) {
-	r.commands = append(r.commands, ClipRoundRectCommand{
+	r.mustEmit(ClipRoundRectCommand{
 		X: x, Y: y, W: w, H: h, Radius: radius,
 	})
 }
@@ -1048,7 +1127,7 @@ func (r *Recorder) DrawImage(img image.Image, x, y int) {
 	srcRect := NewRect(0, 0, float64(w), float64(h))
 	dstRect := NewRectFromPoints(x1, y1, x2, y2)
 
-	r.commands = append(r.commands, DrawImageCommand{
+	r.mustEmit(DrawImageCommand{
 		Image:   imageRef,
 		SrcRect: srcRect,
 		DstRect: dstRect,
@@ -1079,7 +1158,7 @@ func (r *Recorder) DrawImageAnchored(img image.Image, x, y int, ax, ay float64) 
 	srcRect := NewRect(0, 0, float64(w), float64(h))
 	dstRect := NewRectFromPoints(x1, y1, x2, y2)
 
-	r.commands = append(r.commands, DrawImageCommand{
+	r.mustEmit(DrawImageCommand{
 		Image:   imageRef,
 		SrcRect: srcRect,
 		DstRect: dstRect,
@@ -1106,7 +1185,7 @@ func (r *Recorder) DrawImageScaled(img image.Image, x, y, w, h float64) {
 	srcRect := NewRect(0, 0, float64(srcW), float64(srcH))
 	dstRect := NewRectFromPoints(x1, y1, x2, y2)
 
-	r.commands = append(r.commands, DrawImageCommand{
+	r.mustEmit(DrawImageCommand{
 		Image:   imageRef,
 		SrcRect: srcRect,
 		DstRect: dstRect,
@@ -1147,7 +1226,7 @@ func (r *Recorder) DrawString(s string, x, y float64) {
 	px, py := r.transform.TransformPoint(x, y)
 	brushRef := r.resources.AddBrush(r.fillBrush)
 
-	r.commands = append(r.commands, DrawTextCommand{
+	r.mustEmit(DrawTextCommand{
 		Text:       s,
 		X:          px,
 		Y:          py,
@@ -1189,7 +1268,7 @@ func (r *Recorder) StrokeString(s string, x, y float64) {
 		DashOffset:  r.dashOffset,
 	}
 
-	r.commands = append(r.commands, StrokeTextCommand{
+	r.mustEmit(StrokeTextCommand{
 		Text:       s,
 		X:          px,
 		Y:          py,

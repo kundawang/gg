@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Streaming recording protocol** — `recording` can now write and read a
+  recording incrementally, so a long recording never has to live in memory.
+  `Recorder.StreamTo` / `Recording.StreamTo` attach to any `io.Writer` and
+  frame each canvas, resource, and command as it is produced;
+  `recording.NewStreamReader` consumes the same bytes from any `io.Reader` and
+  can either render as it goes (`StreamReader.Playback`, constant memory) or
+  assemble a complete `Recording` (`StreamReader.ReadAll`). The wire format is
+  versioned, byte-order tagged, length-delimited, and per-frame CRC-checked,
+  with an end frame carrying stream totals and a whole-stream checksum.
+  Truncation, unknown tags, oversized lengths, duplicate and unresolved
+  resources, unfinished streams, cancellation, and underlying I/O errors all
+  return a `*recording.StreamError` with the chunk and command numbers.
+  `Recorder.Reset` bounds producer-side memory during a streaming loop.
+
+
 ## [0.52.6] - 2026-11-08
 
 ### Security
