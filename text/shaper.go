@@ -37,6 +37,8 @@ func SetShaper(s Shaper) {
 		s = defaultOwnShaper
 	}
 	globalShaper = s
+	// Cluster glyph resolutions depend on shaping results; drop them.
+	clearClusterGlyphCache()
 }
 
 // GetShaper returns the current global shaper.
