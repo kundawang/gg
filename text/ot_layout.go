@@ -184,65 +184,6 @@ func parseFeatureTable(data []byte, tag [4]byte) otFeature {
 	return f
 }
 
-// otLookup represents a parsed Lookup table header.
-// The subtable data slices are relative to the beginning of each subtable.
-type otLookup struct {
-	lookupType uint16
-	lookupFlag uint16
-	subtables  [][]byte // raw subtable data slices
-}
-
-// parseLookupList parses the LookupList and returns raw lookup entries.
-func parseLookupList(data []byte) []otLookup {
-	if len(data) < 2 {
-		return nil
-	}
-	lookupCount := int(binary.BigEndian.Uint16(data[0:2]))
-	if len(data) < 2+lookupCount*2 {
-		return nil
-	}
-
-	lookups := make([]otLookup, 0, lookupCount)
-	for i := range lookupCount {
-		lookupOffset := int(binary.BigEndian.Uint16(data[2+i*2 : 2+i*2+2]))
-		if lookupOffset >= len(data) {
-			continue
-		}
-		lu := parseLookupTable(data[lookupOffset:])
-		lookups = append(lookups, lu)
-	}
-	return lookups
-}
-
-// parseLookupTable parses a single Lookup table.
-func parseLookupTable(data []byte) otLookup {
-	lu := otLookup{}
-	if len(data) < 6 {
-		return lu
-	}
-	lu.lookupType = binary.BigEndian.Uint16(data[0:2])
-	lu.lookupFlag = binary.BigEndian.Uint16(data[2:4])
-	subtableCount := int(binary.BigEndian.Uint16(data[4:6]))
-
-	headerSize := 6
-	// If UseMarkFilteringSet flag (bit 4) is set, there is an extra uint16 after subtable offsets.
-	// We skip it — it is used for mark filtering which is not yet implemented.
-
-	if len(data) < headerSize+subtableCount*2 {
-		return lu
-	}
-
-	lu.subtables = make([][]byte, 0, subtableCount)
-	for i := range subtableCount {
-		stOffset := int(binary.BigEndian.Uint16(data[headerSize+i*2 : headerSize+i*2+2]))
-		if stOffset >= len(data) {
-			continue
-		}
-		lu.subtables = append(lu.subtables, data[stOffset:])
-	}
-	return lu
-}
-
 // --- Coverage Tables ---
 
 // otCoverage provides glyph containment check.

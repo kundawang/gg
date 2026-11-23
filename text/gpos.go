@@ -18,16 +18,27 @@ import "encoding/binary"
 
 // gposTable holds parsed GPOS data ready for positioning.
 type gposTable struct {
-	scripts  []otScript
-	features []otFeature
-	lookups  []otLookup
+	scripts   []otScript
+	features  []otFeature
+	lookups   []otLookup
+	parseErrs []OTLookupError // lookup parse diagnostics (lenient mode)
 }
 
-// parseGPOS parses the raw GPOS table data.
+// parseGPOS parses the raw GPOS table data in lenient mode: malformed
+// lookups are skipped (recorded in gposTable.parseErrs) without affecting
+// the remaining lookups.
 func parseGPOS(data []byte) *gposTable {
+	g, _ := parseGPOSMode(data, otParseLenient)
+	return g
+}
+
+// parseGPOSMode parses the raw GPOS table data with the given parse mode.
+// In strict mode the first malformed lookup structure is returned as the
+// error (an *OTLookupError) and the table is nil.
+func parseGPOSMode(data []byte, mode otParseMode) (*gposTable, error) {
 	hdr, ok := parseOTLayoutHeader(data)
 	if !ok {
-		return nil
+		return nil, nil
 	}
 
 	var g gposTable
@@ -38,9 +49,14 @@ func parseGPOS(data []byte) *gposTable {
 		g.features = parseFeatureList(data[hdr.featureListOffset:])
 	}
 	if int(hdr.lookupListOffset) < len(data) {
-		g.lookups = parseLookupList(data[hdr.lookupListOffset:])
+		ll, err := parseLookupListEx(data[hdr.lookupListOffset:], "GPOS", mode)
+		if err != nil {
+			return nil, err
+		}
+		g.lookups = ll.lookups
+		g.parseErrs = ll.errors
 	}
-	return &g
+	return &g, nil
 }
 
 // gposAdjustment holds the positioning adjustments for a glyph.
@@ -81,26 +97,27 @@ func (g *gposTable) applyLookup(lu *otLookup, glyphs []shapingGlyph, adj []gposA
 	}
 
 	for _, st := range lu.subtables {
-		g.applySubtable(lookupType, st, glyphs, adj)
+		g.applySubtable(lookupType, st.data, glyphs, adj)
 	}
 }
 
 // applyExtensionLookup handles GPOS Lookup Type 9 (Extension Positioning).
 func (g *gposTable) applyExtensionLookup(lu *otLookup, glyphs []shapingGlyph, adj []gposAdjustment) {
 	for _, st := range lu.subtables {
-		if len(st) < 8 {
+		data := st.data
+		if len(data) < 8 {
 			continue
 		}
-		format := binary.BigEndian.Uint16(st[0:2])
+		format := binary.BigEndian.Uint16(data[0:2])
 		if format != 1 {
 			continue
 		}
-		extType := binary.BigEndian.Uint16(st[2:4])
-		extOffset := binary.BigEndian.Uint32(st[4:8])
-		if int(extOffset) >= len(st) {
+		extType := binary.BigEndian.Uint16(data[2:4])
+		extOffset := binary.BigEndian.Uint32(data[4:8])
+		if int(extOffset) >= len(data) {
 			continue
 		}
-		g.applySubtable(extType, st[extOffset:], glyphs, adj)
+		g.applySubtable(extType, data[extOffset:], glyphs, adj)
 	}
 }
 
