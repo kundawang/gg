@@ -207,6 +207,9 @@ func TestImageSurfaceCapabilities(t *testing.T) {
 	if !caps.SupportsAntialias {
 		t.Error("ImageSurface should support antialiasing")
 	}
+	if !caps.SupportsBlendModes {
+		t.Error("ImageSurface should support blend modes")
+	}
 }
 
 // TestImageSurfaceImage tests direct image access.

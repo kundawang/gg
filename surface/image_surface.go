@@ -6,7 +6,7 @@ package surface
 import (
 	"image"
 	"image/color"
-	"image/draw"
+	"math"
 
 	"github.com/gogpu/gg/internal/raster"
 )
@@ -38,6 +38,15 @@ type ImageSurface struct {
 	// edgeBuilder converts paths to edges
 	edgeBuilder *raster.EdgeBuilder
 
+	// state is the current blend mode and opacity.
+	state surfaceState
+
+	// stateStack holds the states pushed by Save.
+	stateStack []surfaceState
+
+	// lastErr records the most recent rejected state operation.
+	lastErr error
+
 	// closed tracks if Close has been called
 	closed bool
 }
@@ -57,6 +66,8 @@ func NewImageSurface(width, height int) *ImageSurface {
 		img:         image.NewRGBA(image.Rect(0, 0, width, height)),
 		filler:      raster.NewAnalyticFiller(width, height),
 		edgeBuilder: raster.NewEdgeBuilder(2), // 4x AA quality
+		state:       defaultState(),
+		stateStack:  make([]surfaceState, 0, 4),
 	}
 }
 
@@ -73,6 +84,8 @@ func NewImageSurfaceFromImage(img *image.RGBA) *ImageSurface {
 		img:         img,
 		filler:      raster.NewAnalyticFiller(width, height),
 		edgeBuilder: raster.NewEdgeBuilder(2),
+		state:       defaultState(),
+		stateStack:  make([]surfaceState, 0, 4),
 	}
 }
 
@@ -86,32 +99,57 @@ func (s *ImageSurface) Height() int {
 	return s.height
 }
 
-// Clear fills the entire surface with the given color.
+// Clear fills the entire surface with the given color, replacing prior
+// contents rather than compositing over them.
+//
+// Clear resets the surface, so it ignores the current blend mode and opacity;
+// [Surface.Clear] documents it as the way to reset a surface. A color with
+// alpha 0 erases the surface to transparent black.
 func (s *ImageSurface) Clear(c color.Color) {
-	if s.closed {
+	if s.closed || s.img == nil {
 		return
 	}
 
-	r, g, b, a := c.RGBA()
-	//nolint:gosec // G115: safe - r>>8 is always in [0, 255]
-	rgba := color.RGBA{
-		R: uint8(r >> 8),
-		G: uint8(g >> 8),
-		B: uint8(b >> 8),
-		A: uint8(a >> 8),
+	src := premulBytes(c)
+	if src.A == 0 {
+		// A fully transparent (or nil) clear erases all previous content.
+		for y := 0; y < s.height; y++ {
+			row := s.img.Pix[y*s.img.Stride : y*s.img.Stride+s.width*4]
+			clear(row)
+		}
+		return
 	}
-
-	draw.Draw(s.img, s.img.Bounds(), &image.Uniform{rgba}, image.Point{}, draw.Src)
+	for y := 0; y < s.height; y++ {
+		row := s.img.Pix[y*s.img.Stride : y*s.img.Stride+s.width*4]
+		for i := 0; i < len(row); i += 4 {
+			row[i+0] = src.R
+			row[i+1] = src.G
+			row[i+2] = src.B
+			row[i+3] = src.A
+		}
+	}
 }
 
 // Fill fills the given path using the specified style.
+//
+// The path is rasterized with the surface's current blend mode and opacity.
+// Paths with non-finite coordinates are ignored, as are empty paths.
 func (s *ImageSurface) Fill(path *Path, style FillStyle) {
-	if s.closed || path == nil || path.IsEmpty() {
+	if s.closed || s.img == nil || path == nil || path.IsEmpty() {
 		return
 	}
 
 	// Get fill color
-	fillColor := s.resolveColor(style.Color, style.Pattern)
+	opacity := opacityByte(s.state.opacity)
+	if opacity == 0 {
+		return
+	}
+	fillColor := scalePremul(s.resolveColor(style.Color, style.Pattern), opacity)
+
+	safePath, ok := clampPath(path)
+	if !ok {
+		return
+	}
 
 	// Convert fill rule
 	var fillRule raster.FillRule
@@ -125,11 +163,14 @@ func (s *ImageSurface) Fill(path *Path, style FillStyle) {
 	// Build edges from path
 	s.edgeBuilder.Reset()
 	s.edgeBuilder.SetFlattenCurves(false)
-	s.edgeBuilder.BuildFromPath(path, raster.IdentityTransform{})
+	s.applyClipBounds()
+	s.edgeBuilder.BuildFromPath(safePath, raster.IdentityTransform{})
 
 	if s.edgeBuilder.IsEmpty() {
 		return
 	}
+
+	mode := s.state.blendMode
 
 	// Reset filler and render
 	s.filler.Reset()
@@ -137,33 +178,54 @@ func (s *ImageSurface) Fill(path *Path, style FillStyle) {
 		if y < 0 || y >= s.height {
 			return
 		}
-		s.blendRow(y, runs, fillColor)
+		s.blendRow(y, runs, fillColor, mode)
 	})
 }
 
 // Stroke strokes the given path using the specified style.
+//
+// The stroke is rasterized with the surface's current blend mode and opacity.
 func (s *ImageSurface) Stroke(path *Path, style StrokeStyle) {
-	if s.closed || path == nil || path.IsEmpty() {
+	if s.closed || s.img == nil || path == nil || path.IsEmpty() {
 		return
 	}
 
-	// Get stroke color
-	strokeColor := s.resolveColor(style.Color, style.Pattern)
+	opacity := opacityByte(s.state.opacity)
+	if opacity == 0 {
+		return
+	}
+
+	safePath, ok := clampPath(path)
+	if !ok {
+		return
+	}
+
+	// Get stroke color, with surface opacity folded into the premultiplied
+	// value so the per-pixel path only applies coverage.
+	strokeColor := scalePremul(s.resolveColor(style.Color, style.Pattern), opacity)
 
 	// Create stroke path by expanding the original path
-	strokePath := s.expandStroke(path, style)
+	strokePath := s.expandStroke(safePath, style)
 	if strokePath == nil || strokePath.IsEmpty() {
+		return
+	}
+
+	safeStroke, ok := clampPath(strokePath)
+	if !ok {
 		return
 	}
 
 	// Build edges from expanded stroke path
 	s.edgeBuilder.Reset()
 	s.edgeBuilder.SetFlattenCurves(false)
-	s.edgeBuilder.BuildFromPath(strokePath, raster.IdentityTransform{})
+	s.applyClipBounds()
+	s.edgeBuilder.BuildFromPath(safeStroke, raster.IdentityTransform{})
 
 	if s.edgeBuilder.IsEmpty() {
 		return
 	}
+
+	mode := s.state.blendMode
 
 	// Render as filled shape (stroke expansion creates filled outline)
 	s.filler.Reset()
@@ -171,47 +233,87 @@ func (s *ImageSurface) Stroke(path *Path, style StrokeStyle) {
 		if y < 0 || y >= s.height {
 			return
 		}
-		s.blendRow(y, runs, strokeColor)
+		s.blendRow(y, runs, strokeColor, mode)
 	})
 }
 
 // DrawImage draws an image at the specified position.
+//
+// The image is composited with the surface's current blend mode and opacity.
+// opts.Alpha is sanitized (clamped to [0, 1], NaN treated as 1), and the
+// intersection with the surface bounds is clipped, so an image placed partly
+// or entirely outside the surface is drawn without affecting unrelated pixels.
 func (s *ImageSurface) DrawImage(img image.Image, at Point, opts *DrawImageOptions) {
-	if s.closed || img == nil {
+	if s.closed || s.img == nil || img == nil {
 		return
 	}
 
 	srcBounds := img.Bounds()
 	if opts != nil && opts.SrcRect != nil {
-		srcBounds = *opts.SrcRect
+		srcBounds = srcBounds.Intersect(*opts.SrcRect)
+	}
+	if srcBounds.Empty() {
+		return
 	}
 
-	dstX := int(at.X)
-	dstY := int(at.Y)
+	if math.IsNaN(at.X) || math.IsNaN(at.Y) || math.IsInf(at.X, 0) || math.IsInf(at.Y, 0) {
+		return
+	}
 
 	alpha := 1.0
 	if opts != nil {
-		alpha = opts.Alpha
+		alpha = sanitizeOpacity(opts.Alpha)
+	}
+	opacity := opacityByte(s.state.opacity * alpha)
+	if opacity == 0 {
+		return
 	}
 
-	// Simple nearest-neighbor blit for now
-	for sy := srcBounds.Min.Y; sy < srcBounds.Max.Y; sy++ {
-		dy := dstY + (sy - srcBounds.Min.Y)
-		if dy < 0 || dy >= s.height {
+	// Clamp the destination origin into a range where float64->int conversion is
+	// well defined. Anything beyond this cannot overlap a surface whose
+	// dimensions fit in an int, so the clipping below discards it anyway.
+	const originLimit = float64(1 << 40)
+	if at.X <= -originLimit || at.X >= originLimit || at.Y <= -originLimit || at.Y >= originLimit {
+		return
+	}
+	dstX, dstY := int(at.X), int(at.Y)
+
+	// Clamp the whole destination rectangle to the surface once, instead of
+	// testing every source pixel. Widen before adding so a huge image cannot
+	// overflow the rect corners.
+	w := int64(srcBounds.Dx())
+	h := int64(srcBounds.Dy())
+	x0 := max(int64(dstX), 0)
+	y0 := max(int64(dstY), 0)
+	x1 := min(int64(dstX)+w, int64(s.width))
+	y1 := min(int64(dstY)+h, int64(s.height))
+	if x0 >= x1 || y0 >= y1 {
+		return
+	}
+
+	s.drawImageRegion(img, srcBounds, dstX, dstY, int(x0), int(y0), int(x1), int(y1), opacity, s.state.blendMode)
+}
+
+// drawImageRegion blits the clipped destination rectangle [x0,y0)-(x1,y1) of
+// img. srcBounds and the destination origin map surface pixels to source
+// pixels; the caller has already validated and clipped both.
+func (s *ImageSurface) drawImageRegion(
+	img image.Image, srcBounds image.Rectangle,
+	dstX, dstY, x0, y0, x1, y1 int,
+	opacity uint32, mode BlendMode,
+) {
+	for dy := y0; dy < y1; dy++ {
+		sy := srcBounds.Min.Y + (dy - dstY)
+		if sy < srcBounds.Min.Y || sy >= srcBounds.Max.Y {
 			continue
 		}
-
-		for sx := srcBounds.Min.X; sx < srcBounds.Max.X; sx++ {
-			dx := dstX + (sx - srcBounds.Min.X)
-			if dx < 0 || dx >= s.width {
+		for dx := x0; dx < x1; dx++ {
+			sx := srcBounds.Min.X + (dx - dstX)
+			if sx < srcBounds.Min.X || sx >= srcBounds.Max.X {
 				continue
 			}
-
-			srcColor := img.At(sx, sy)
-			if alpha < 1.0 {
-				srcColor = s.applyAlpha(srcColor, alpha)
-			}
-			s.blendPixel(dx, dy, srcColor)
+			src := scalePremul(premulBytes(img.At(sx, sy)), opacity)
+			s.blendPremulPixel(dx, dy, src, 255, mode)
 		}
 	}
 }
@@ -229,7 +331,12 @@ func (s *ImageSurface) Snapshot() *image.RGBA {
 	}
 
 	result := image.NewRGBA(image.Rect(0, 0, s.width, s.height))
-	copy(result.Pix, s.img.Pix)
+	rowBytes := s.width * 4
+	for y := 0; y < s.height; y++ {
+		src := s.img.Pix[y*s.img.Stride : y*s.img.Stride+rowBytes]
+		dst := result.Pix[y*result.Stride : y*result.Stride+rowBytes]
+		copy(dst, src)
+	}
 	return result
 }
 
@@ -257,7 +364,7 @@ func (s *ImageSurface) Capabilities() Capabilities {
 		SupportsSubSurface: false,
 		SupportsResize:     false,
 		SupportsClipping:   false,
-		SupportsBlendModes: false,
+		SupportsBlendModes: true,
 		SupportsAntialias:  true,
 		MaxWidth:           0, // Unlimited
 		MaxHeight:          0,
@@ -266,102 +373,52 @@ func (s *ImageSurface) Capabilities() Capabilities {
 
 // resolveColor extracts color from Color or Pattern.
 // Note: Pattern support is planned for future; currently uses color only.
-func (s *ImageSurface) resolveColor(c color.Color, _ Pattern) color.RGBA {
+func (s *ImageSurface) resolveColor(c color.Color, _ Pattern) premulRGBA {
 	if c != nil {
-		r, g, b, a := c.RGBA()
-		//nolint:gosec // G115: safe - r>>8 is always in [0, 255]
-		return color.RGBA{
-			R: uint8(r >> 8),
-			G: uint8(g >> 8),
-			B: uint8(b >> 8),
-			A: uint8(a >> 8),
-		}
+		return premulBytes(c)
 	}
 	// Pattern would be sampled per-pixel, but for now use black
-	return color.RGBA{0, 0, 0, 255}
+	return premulRGBA{A: 255}
 }
 
 // blendRow blends alpha runs onto a scanline.
-func (s *ImageSurface) blendRow(y int, runs *raster.AlphaRuns, c color.RGBA) {
+//
+// c is the premultiplied fill color with opacity already folded in. Coverage is
+// passed to blendPremulPixel, which applies it per mode: Porter-Duff results
+// are interpolated with the destination, while separable modes scale the
+// source alpha before blending.
+func (s *ImageSurface) blendRow(y int, runs *raster.AlphaRuns, c premulRGBA, mode BlendMode) {
 	for x, alpha := range runs.Iter() {
 		if x < 0 || x >= s.width {
 			continue
 		}
-		s.blendPixelAlpha(x, y, c, alpha)
+		if alpha == 0 {
+			continue
+		}
+		s.blendPremulPixel(x, y, c, alpha, mode)
 	}
 }
 
-// blendPixelAlpha blends a color with coverage alpha onto the image.
-func (s *ImageSurface) blendPixelAlpha(x, y int, src color.RGBA, alpha uint8) {
-	if alpha == 0 {
+// blendPremulPixel composites a premultiplied source color with per-pixel
+// coverage onto the image.
+func (s *ImageSurface) blendPremulPixel(x, y int, src premulRGBA, coverage uint8, mode BlendMode) {
+	if coverage == 0 {
 		return
 	}
 
-	idx := s.img.PixOffset(x, y)
-
-	if alpha == 255 && src.A == 255 {
-		// Fully opaque - direct write
-		s.img.Pix[idx+0] = src.R
-		s.img.Pix[idx+1] = src.G
-		s.img.Pix[idx+2] = src.B
-		s.img.Pix[idx+3] = src.A
-		return
+	idx := s.pixOffset(x, y)
+	dst := premulRGBA{
+		R: s.img.Pix[idx+0],
+		G: s.img.Pix[idx+1],
+		B: s.img.Pix[idx+2],
+		A: s.img.Pix[idx+3],
 	}
 
-	// Source-over compositing with coverage
-	// srcA = src.A * alpha / 255
-	srcA := uint32(src.A) * uint32(alpha) / 255
-	invSrcA := 255 - srcA
-
-	dstR := uint32(s.img.Pix[idx+0])
-	dstG := uint32(s.img.Pix[idx+1])
-	dstB := uint32(s.img.Pix[idx+2])
-	dstA := uint32(s.img.Pix[idx+3])
-
-	outA := srcA + dstA*invSrcA/255
-	if outA == 0 {
-		return
-	}
-
-	outR := (uint32(src.R)*srcA + dstR*dstA*invSrcA/255) / outA
-	outG := (uint32(src.G)*srcA + dstG*dstA*invSrcA/255) / outA
-	outB := (uint32(src.B)*srcA + dstB*dstA*invSrcA/255) / outA
-
-	//nolint:gosec // G115: safe - values are clamped to [0, 255]
-	s.img.Pix[idx+0] = uint8(outR)
-	//nolint:gosec // G115: safe
-	s.img.Pix[idx+1] = uint8(outG)
-	//nolint:gosec // G115: safe
-	s.img.Pix[idx+2] = uint8(outB)
-	//nolint:gosec // G115: safe
-	s.img.Pix[idx+3] = uint8(outA)
-}
-
-// blendPixel blends a color onto the image at (x, y).
-func (s *ImageSurface) blendPixel(x, y int, src color.Color) {
-	r, g, b, a := src.RGBA()
-	//nolint:gosec // G115: safe - r>>8 is always in [0, 255]
-	srcR := uint8(r >> 8)
-	//nolint:gosec // G115: safe
-	srcG := uint8(g >> 8)
-	//nolint:gosec // G115: safe
-	srcB := uint8(b >> 8)
-	//nolint:gosec // G115: safe
-	srcA := uint8(a >> 8)
-	s.blendPixelAlpha(x, y, color.RGBA{srcR, srcG, srcB, srcA}, 255)
-}
-
-// applyAlpha multiplies a color's alpha by the given factor.
-func (s *ImageSurface) applyAlpha(c color.Color, alpha float64) color.Color {
-	r, g, b, a := c.RGBA()
-	newA := uint16(float64(a) * alpha)
-	//nolint:gosec // G115: safe - r,g,b are uint32 from RGBA() which fits uint16
-	return color.RGBA64{
-		R: uint16(r),
-		G: uint16(g),
-		B: uint16(b),
-		A: newA,
-	}
+	out := blendPremul(mode, src, dst, coverage)
+	s.img.Pix[idx+0] = out.R
+	s.img.Pix[idx+1] = out.G
+	s.img.Pix[idx+2] = out.B
+	s.img.Pix[idx+3] = out.A
 }
 
 // expandStroke creates a filled path representing the stroke outline.
@@ -607,3 +664,5 @@ func sqrtf32(x float32) float32 {
 // Verify ImageSurface implements Surface interface.
 var _ Surface = (*ImageSurface)(nil)
 var _ CapableSurface = (*ImageSurface)(nil)
+var _ BlendableSurface = (*ImageSurface)(nil)
+var _ StatefulSurface = (*ImageSurface)(nil)

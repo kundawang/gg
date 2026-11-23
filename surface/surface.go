@@ -33,6 +33,7 @@ type Surface interface {
 
 	// Clear fills the entire surface with the given color.
 	// This is typically the fastest way to reset the surface.
+	// Clear is not affected by a surface's blend mode or opacity.
 	Clear(c color.Color)
 
 	// Fill fills the given path using the specified style.
@@ -101,17 +102,52 @@ type ClippableSurface interface {
 }
 
 // BlendableSurface is an optional interface for surfaces with blend mode support.
+//
+// ImageSurface implements it. The blend mode set here applies to Fill, Stroke
+// and DrawImage; Clear always resets the surface and ignores it.
+// [ImageSurface.TrySetBlendMode] is the error-reporting variant for callers
+// that need to detect a rejected mode.
 type BlendableSurface interface {
 	Surface
 
 	// SetBlendMode sets the blend mode for subsequent operations.
+	// An unsupported mode is ignored; see ImageSurface.TrySetBlendMode.
 	SetBlendMode(mode BlendMode)
 
 	// BlendMode returns the current blend mode.
 	BlendMode() BlendMode
 }
 
+// StatefulSurface is an optional interface for surfaces that keep a savable
+// drawing state (blend mode and opacity).
+//
+// ImageSurface implements it. Save/Restore nest like a stack: an unbalanced
+// Restore on an empty stack is a no-op.
+type StatefulSurface interface {
+	Surface
+
+	// Save pushes the current blend mode and opacity.
+	Save()
+
+	// Restore pops the most recently saved state, if any.
+	Restore()
+
+	// SetOpacity sets the opacity applied to subsequent drawing operations.
+	// Values are clamped to [0, 1]; NaN is treated as 1.
+	SetOpacity(opacity float64) error
+
+	// Opacity returns the current opacity in [0, 1].
+	Opacity() float64
+}
+
 // BlendMode specifies how source and destination colors are combined.
+//
+// Values are combined using premultiplied-alpha source-over compositing for
+// the Porter-Duff modes (SourceOver, Clear, Copy) and the W3C Compositing and
+// Blending Level 1 formula for the separable modes (Multiply, Screen,
+// Overlay). Overlay's branches are chosen by the destination (backdrop), which
+// matches the specification's definition of overlay as hard-light with the
+// source and backdrop swapped.
 type BlendMode uint8
 
 const (
@@ -124,13 +160,15 @@ const (
 	// BlendModeScreen is the inverse of multiply.
 	BlendModeScreen
 
-	// BlendModeOverlay combines multiply and screen.
+	// BlendModeOverlay combines multiply and screen. The destination decides
+	// which branch a channel takes.
 	BlendModeOverlay
 
-	// BlendModeClear clears the destination.
+	// BlendModeClear clears the destination: every covered pixel becomes
+	// transparent black, regardless of the source color.
 	BlendModeClear
 
-	// BlendModeCopy replaces destination with source.
+	// BlendModeCopy replaces destination with source, including its alpha.
 	BlendModeCopy
 )
 

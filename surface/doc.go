@@ -64,6 +64,34 @@
 //	// Get the result
 //	img := s.Snapshot()
 //
+// # Blend Modes and Opacity
+//
+// ImageSurface implements [BlendableSurface] and [StatefulSurface]. The blend
+// mode and opacity set on a surface apply to Fill, Stroke and DrawImage:
+//
+//	s.SetBlendMode(surface.BlendModeMultiply)
+//	s.SetOpacity(0.5)
+//	s.Fill(path, surface.FillStyle{Color: color.RGBA{255, 0, 0, 255}})
+//	s.Save()          // remember multiply @ 0.5
+//	s.SetBlendMode(surface.BlendModeScreen)
+//	s.DrawImage(img, surface.Pt(0, 0), nil)
+//	s.Restore()       // back to multiply @ 0.5
+//
+// Six modes are supported: SourceOver (the default), Multiply, Screen, Overlay,
+// Clear and Copy. Porter-Duff modes use premultiplied source-over compositing
+// and anti-aliased coverage; the separable modes follow the W3C Compositing and
+// Blending Level 1 formula. Clear always resets the surface and ignores the
+// blend mode and opacity, matching [Surface.Clear].
+//
+// An unknown mode is rejected without touching the surface: the no-return
+// SetBlendMode records it for [ImageSurface.LastError], and TrySetBlendMode
+// returns an [*UnknownBlendModeError] (matching [ErrUnknownBlendMode]).
+// SetOpacity clamps to [0, 1] and maps NaN to 1.
+//
+// ImageSurface is not safe for concurrent use; create one surface per goroutine.
+// Drawing after Close is a safe no-op, while the error-returning state methods
+// report [ErrSurfaceClosed].
+//
 // # Integration with gg.Context
 //
 // The surface package is designed to integrate with gg.Context (see INT-001).

@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **ImageSurface blend modes and opacity** — `surface.ImageSurface` now
+  implements `BlendableSurface` and the new `StatefulSurface` interface.
+  `SetBlendMode`/`BlendMode` plus `Save`/`Restore`/`SetOpacity`/`Opacity`
+  apply to `Fill`, `Stroke` and `DrawImage`, which all share one premultiplied
+  source/destination pipeline. Supported modes: source-over (default), clear,
+  copy, multiply, screen, overlay; Porter-Duff modes interpolate the full
+  result by anti-aliased coverage, separable modes use the W3C Compositing and
+  Blending Level 1 formula. `SetOpacity` clamps to [0, 1] and maps NaN to 1.
+  An unknown mode changes neither the state nor the pixels and is reported via
+  `TrySetBlendMode` (an `*UnknownBlendModeError` matching `ErrUnknownBlendMode`)
+  or `LastError`. `Capabilities().SupportsBlendModes` is now true.
+- **ImageSurface robustness** — non-finite path coordinates are ignored
+  instead of reaching fixed-point conversion; finite coordinates far outside
+  the surface are clamped so huge regions cannot overflow the rasterizer;
+  colour values are saturated and premultiplied invariants enforced; drawing
+  after `Close` stays a no-op while `TrySetBlendMode`/`SetOpacity` report
+  `ErrSurfaceClosed`. `DrawImage` now clips the destination rectangle to the
+  surface and honours `SrcRect` intersections, and surfaces built from an
+  image with a non-zero origin or padded stride render and snapshot correctly.
+
 ### Fixed
 
 - **Text-outline glyph cache collision between font faces** — Font IDs used by
