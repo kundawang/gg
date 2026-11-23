@@ -69,6 +69,11 @@ type Context struct {
 	antiAliasStack []bool   // Push/Pop stack for antiAlias state
 	paintStack     []*Paint // Push/Pop stack for paint state (fill/stroke brushes, blend mode)
 
+	// adaptiveFlatten opts CPU Fill/Stroke into the budget-constrained
+	// adaptive flattener. Default false keeps the legacy rasterizer path.
+	adaptiveFlatten bool
+	flattenState    *FlattenState // reusable scratch for adaptive flatten
+
 	// Text rendering
 	textMode         TextMode               // text strategy selection (default: Auto)
 	outlineExtractor *text.OutlineExtractor // lazy: for transform-aware text (Strategy B)
@@ -187,6 +192,7 @@ func NewContext(width, height int, opts ...ContextOption) *Context {
 		pipelineMode:          options.pipelineMode,
 		damageTrackingEnabled: true,
 		antiAlias:             true,
+		adaptiveFlatten:       options.adaptiveFlatten,
 	}
 }
 
@@ -323,6 +329,21 @@ func (c *Context) SetRasterizerMode(mode RasterizerMode) {
 // RasterizerMode returns the current rasterizer mode.
 func (c *Context) RasterizerMode() RasterizerMode {
 	return c.rasterizerMode
+}
+
+// SetAdaptiveFlatten toggles the budget-constrained adaptive flattener for
+// CPU Fill/Stroke. Off by default; see WithAdaptiveFlatten. The setting does
+// not affect GPU-accelerated draws.
+func (c *Context) SetAdaptiveFlatten(enabled bool) {
+	c.adaptiveFlatten = enabled
+	if enabled && c.flattenState == nil {
+		c.flattenState = NewFlattenState()
+	}
+}
+
+// AdaptiveFlatten reports whether CPU Fill/Stroke use the adaptive flattener.
+func (c *Context) AdaptiveFlatten() bool {
+	return c.adaptiveFlatten
 }
 
 // SetAntiAlias enables or disables anti-aliasing for geometry rendering.
@@ -1096,6 +1117,27 @@ func (c *Context) deviceSpacePath() *Path {
 	return c.path.Transform(c.deviceMatrix)
 }
 
+// adaptiveFlattenPath returns a line-only, budget-constrained flattening of
+// the device-space path. The flatness budget is measured in physical device
+// pixels (0.1 px, matching the edge builder's default tolerance divided by
+// device scale). Subpath boundaries and direction are preserved and contours
+// are never joined. The returned path is owned by the context's FlattenState
+// and is overwritten on the next call.
+func (c *Context) adaptiveFlattenPath(devicePath *Path) *Path {
+	if c.flattenState == nil {
+		c.flattenState = NewFlattenState()
+	}
+	tol := 0.1
+	if c.deviceScale > 1 {
+		tol = 0.1 / c.deviceScale
+	}
+	flat, _ := devicePath.FlattenAdaptive(c.flattenState, FlattenOptions{
+		Tolerance: tol,
+		MaxPoints: defaultMaxFlattenPoints,
+	})
+	return flat
+}
+
 // SetPixel sets a single pixel.
 func (c *Context) SetPixel(x, y int, col RGBA) {
 	c.pixmap.SetPixel(x, y, col)
@@ -1848,7 +1890,14 @@ func (c *Context) doFill() error {
 		}()
 	}
 
-	return c.renderer.Fill(c.pixmap, devicePath, c.paint)
+	renderPath := devicePath
+	if c.adaptiveFlatten {
+		// Curvature-based, budget-constrained flatten in device space.
+		// The line-only path exercises the same edge builder as before,
+		// just with segments chosen by the adaptive flattener.
+		renderPath = c.adaptiveFlattenPath(devicePath)
+	}
+	return c.renderer.Fill(c.pixmap, renderPath, c.paint)
 }
 
 // doStroke performs the stroke operation respecting the current RasterizerMode.
@@ -1900,7 +1949,11 @@ func (c *Context) doStroke() error {
 		}()
 	}
 
-	return c.renderer.Stroke(c.pixmap, devicePath, c.paint)
+	renderPath := devicePath
+	if c.adaptiveFlatten {
+		renderPath = c.adaptiveFlattenPath(devicePath)
+	}
+	return c.renderer.Stroke(c.pixmap, renderPath, c.paint)
 }
 
 // applyClipToPaint configures the paint for clip application using the three-tier

@@ -14,10 +14,11 @@ type ContextOption func(*contextOptions)
 
 // contextOptions holds optional configuration for Context creation.
 type contextOptions struct {
-	renderer     Renderer
-	pixmap       *Pixmap
-	pipelineMode PipelineMode
-	deviceScale  float64
+	renderer        Renderer
+	pixmap          *Pixmap
+	pipelineMode    PipelineMode
+	deviceScale     float64
+	adaptiveFlatten bool
 }
 
 // defaultOptions returns the default context options.
@@ -99,5 +100,19 @@ func WithDeviceScale(scale float64) ContextOption {
 		if scale > 0 {
 			o.deviceScale = scale
 		}
+	}
+}
+
+// WithAdaptiveFlatten opts into the budget-constrained adaptive flattener
+// (Path.FlattenAdaptive) for CPU Fill/Stroke operations.
+//
+// It is off by default: the legacy edge-builder flatten path stays the
+// default so existing pixel output is unchanged. When enabled, curves are
+// flattened in device space with a curvature-based subdivision under a
+// 1,000,000-vertex budget before reaching the CPU rasterizer; GPU-accelerated
+// draws are unaffected.
+func WithAdaptiveFlatten(enabled bool) ContextOption {
+	return func(o *contextOptions) {
+		o.adaptiveFlatten = enabled
 	}
 }
