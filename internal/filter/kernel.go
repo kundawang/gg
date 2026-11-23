@@ -1,9 +1,6 @@
 package filter
 
-import (
-	"math"
-	"sync"
-)
+import "math"
 
 // GaussianKernel generates a 1D Gaussian kernel for the given radius.
 // The kernel is normalized so all values sum to 1.0.
@@ -11,10 +8,16 @@ import (
 // The kernel size is computed as 2 * ceil(radius * 3) + 1, which covers
 // 99.7% of the Gaussian distribution (3 standard deviations).
 //
-// For radius <= 0, returns a single-element kernel [1.0] (identity).
+// For radius <= 0 or a non-finite radius (NaN, +/-Inf), returns a
+// single-element kernel [1.0] (identity). A finite radius above
+// maxGaussianSigma is clamped to maxGaussianSigma so memory use stays
+// bounded regardless of caller input.
 func GaussianKernel(radius float64) []float32 {
-	if radius <= 0 {
-		return []float32{1.0}
+	if !isFinitePositive(radius) {
+		return []float32{1}
+	}
+	if radius > maxGaussianSigma {
+		radius = maxGaussianSigma
 	}
 
 	// Kernel size: 2 * ceil(sigma * 3) + 1
@@ -55,7 +58,7 @@ func GaussianKernel(radius float64) []float32 {
 // Three passes of box blur approximate Gaussian blur well.
 func BoxKernel(radius int) []float32 {
 	if radius <= 0 {
-		return []float32{1.0}
+		return []float32{1}
 	}
 
 	size := radius*2 + 1
@@ -67,66 +70,6 @@ func BoxKernel(radius int) []float32 {
 	}
 
 	return kernel
-}
-
-// kernelCache caches computed Gaussian kernels to avoid recomputation.
-// Key is radius * 100 (to handle float precision), value is kernel.
-type kernelCache struct {
-	mu     sync.RWMutex
-	cache  map[int][]float32
-	maxLen int
-}
-
-var defaultKernelCache = newKernelCache(64)
-
-// newKernelCache creates a kernel cache with the given maximum entries.
-func newKernelCache(maxLen int) *kernelCache {
-	return &kernelCache{
-		cache:  make(map[int][]float32),
-		maxLen: maxLen,
-	}
-}
-
-// get retrieves a kernel from cache or generates and caches it.
-func (c *kernelCache) get(radius float64) []float32 {
-	// Quantize radius to 0.01 precision
-	key := int(radius * 100)
-
-	// Try read lock first
-	c.mu.RLock()
-	if kernel, ok := c.cache[key]; ok {
-		c.mu.RUnlock()
-		return kernel
-	}
-	c.mu.RUnlock()
-
-	// Generate kernel
-	kernel := GaussianKernel(radius)
-
-	// Cache with write lock
-	c.mu.Lock()
-	if len(c.cache) >= c.maxLen {
-		// Simple eviction: clear half the cache
-		// In production, LRU would be better
-		count := 0
-		for k := range c.cache {
-			delete(c.cache, k)
-			count++
-			if count >= c.maxLen/2 {
-				break
-			}
-		}
-	}
-	c.cache[key] = kernel
-	c.mu.Unlock()
-
-	return kernel
-}
-
-// CachedGaussianKernel returns a cached Gaussian kernel for the radius.
-// This is more efficient when the same radius is used repeatedly.
-func CachedGaussianKernel(radius float64) []float32 {
-	return defaultKernelCache.get(radius)
 }
 
 // OptimalKernelSize returns the optimal kernel size for a given radius.
