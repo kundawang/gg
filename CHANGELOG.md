@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Content-preserving `ImageSurface` resize** — `surface.ImageSurface` now
+  implements `ResizableSurface`: `Resize(w, h)` keeps existing pixels anchored
+  top-left, and the new `ResizeWithOptions(w, h, opts)` adds 9 anchor points,
+  pixel offsets (negative allowed, clipped), and a clear color for newly
+  exposed areas. Content is copied byte-for-byte (semi-transparent pixels are
+  preserved exactly), the buffer is reallocated with stride = 4×width and
+  origin (0,0), and surfaces created via `NewImageSurfaceFromImage` detach
+  from the caller's image on the first non-no-op resize. Invalid/zero/negative
+  or oversized dimensions return `ErrInvalidDimensions`/`ErrSurfaceTooLarge`;
+  resizing a closed surface returns `ErrSurfaceClosed`. Operations are
+  serialized internally, so concurrent resize/draw/snapshot is safe.
+  `Capabilities()` now reports `SupportsResize: true` with real max dimensions.
+
 ### Fixed
 
 - **Text-outline glyph cache collision between font faces** ([#514](https://github.com/gogpu/gg/pull/514), @kivutar) —

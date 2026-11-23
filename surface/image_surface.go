@@ -7,6 +7,7 @@ import (
 	"image"
 	"image/color"
 	"image/draw"
+	"sync"
 
 	"github.com/gogpu/gg/internal/raster"
 )
@@ -28,6 +29,10 @@ import (
 //
 //	img := s.Snapshot()
 type ImageSurface struct {
+	// mu serializes public operations so Resize is safe to call
+	// concurrently with drawing, snapshotting, and Close.
+	mu sync.Mutex
+
 	width  int
 	height int
 	img    *image.RGBA
@@ -78,16 +83,22 @@ func NewImageSurfaceFromImage(img *image.RGBA) *ImageSurface {
 
 // Width returns the surface width.
 func (s *ImageSurface) Width() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.width
 }
 
 // Height returns the surface height.
 func (s *ImageSurface) Height() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.height
 }
 
 // Clear fills the entire surface with the given color.
 func (s *ImageSurface) Clear(c color.Color) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.closed {
 		return
 	}
@@ -106,6 +117,8 @@ func (s *ImageSurface) Clear(c color.Color) {
 
 // Fill fills the given path using the specified style.
 func (s *ImageSurface) Fill(path *Path, style FillStyle) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.closed || path == nil || path.IsEmpty() {
 		return
 	}
@@ -143,6 +156,8 @@ func (s *ImageSurface) Fill(path *Path, style FillStyle) {
 
 // Stroke strokes the given path using the specified style.
 func (s *ImageSurface) Stroke(path *Path, style StrokeStyle) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.closed || path == nil || path.IsEmpty() {
 		return
 	}
@@ -177,6 +192,8 @@ func (s *ImageSurface) Stroke(path *Path, style StrokeStyle) {
 
 // DrawImage draws an image at the specified position.
 func (s *ImageSurface) DrawImage(img image.Image, at Point, opts *DrawImageOptions) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.closed || img == nil {
 		return
 	}
@@ -224,6 +241,8 @@ func (s *ImageSurface) Flush() error {
 
 // Snapshot returns a copy of the current surface contents.
 func (s *ImageSurface) Snapshot() *image.RGBA {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.closed {
 		return nil
 	}
@@ -235,6 +254,8 @@ func (s *ImageSurface) Snapshot() *image.RGBA {
 
 // Close releases resources associated with the surface.
 func (s *ImageSurface) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.closed {
 		return nil
 	}
@@ -247,7 +268,14 @@ func (s *ImageSurface) Close() error {
 
 // Image returns the underlying image.RGBA.
 // This is a direct reference, not a copy.
+//
+// The returned image is not synchronized: callers must not use it
+// concurrently with other surface operations. After a non-no-op Resize
+// the reference is stale — it keeps the old contents but the surface
+// no longer draws into it.
 func (s *ImageSurface) Image() *image.RGBA {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.img
 }
 
@@ -255,12 +283,12 @@ func (s *ImageSurface) Image() *image.RGBA {
 func (s *ImageSurface) Capabilities() Capabilities {
 	return Capabilities{
 		SupportsSubSurface: false,
-		SupportsResize:     false,
+		SupportsResize:     true,
 		SupportsClipping:   false,
 		SupportsBlendModes: false,
 		SupportsAntialias:  true,
-		MaxWidth:           0, // Unlimited
-		MaxHeight:          0,
+		MaxWidth:           maxSurfaceDimension,
+		MaxHeight:          maxSurfaceDimension,
 	}
 }
 
@@ -605,5 +633,8 @@ func sqrtf32(x float32) float32 {
 }
 
 // Verify ImageSurface implements Surface interface.
-var _ Surface = (*ImageSurface)(nil)
-var _ CapableSurface = (*ImageSurface)(nil)
+var (
+	_ Surface          = (*ImageSurface)(nil)
+	_ CapableSurface   = (*ImageSurface)(nil)
+	_ ResizableSurface = (*ImageSurface)(nil)
+)
