@@ -159,10 +159,22 @@ func TestTextureUploadDownload(t *testing.T) {
 		t.Error("UploadPixmap() expected error for size mismatch")
 	}
 
-	// Test download (stub returns error)
-	_, err = tex.DownloadPixmap()
-	if !errors.Is(err, ErrTextureReadbackNotSupported) {
-		t.Errorf("DownloadPixmap() error = %v, want %v", err, ErrTextureReadbackNotSupported)
+	// Test download after upload: CPU mirror provides real readback.
+	dl, err := tex.DownloadPixmap()
+	if err != nil {
+		t.Errorf("DownloadPixmap() after upload error = %v", err)
+	} else if dl.Width() != 10 || dl.Height() != 10 {
+		t.Errorf("DownloadPixmap() size = %dx%d, want 10x10", dl.Width(), dl.Height())
+	}
+
+	// Download with no uploaded data returns readback-not-supported.
+	empty, err := CreateTexture(nil, TextureConfig{Width: 4, Height: 4, Format: TextureFormatRGBA8})
+	if err != nil {
+		t.Fatalf("CreateTexture() error = %v", err)
+	}
+	defer empty.Close()
+	if _, err := empty.DownloadPixmap(); !errors.Is(err, ErrTextureReadbackNotSupported) {
+		t.Errorf("DownloadPixmap() without data error = %v, want %v", err, ErrTextureReadbackNotSupported)
 	}
 
 	// Test operations on released texture

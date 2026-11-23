@@ -88,6 +88,7 @@ type GPUShared struct {
 	// All contexts reference these — prevents stale atlas in offscreen sessions.
 	sharedAtlasTex  *wgpu.Texture
 	sharedAtlasView *wgpu.TextureView
+	sharedAtlasSize int // pixel size of sharedAtlasTex (0 = none); enables texture reuse on re-upload
 
 	// Compute pipeline.
 	velloAccel *VelloAccelerator
@@ -311,6 +312,7 @@ func (s *GPUShared) Close() {
 		s.sharedAtlasTex.Release()
 		s.sharedAtlasTex = nil
 	}
+	s.sharedAtlasSize = 0
 	if s.glyphMaskEngine != nil && s.device != nil {
 		s.glyphMaskEngine.Destroy(s.device)
 		s.glyphMaskEngine = nil

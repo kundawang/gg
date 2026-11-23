@@ -1700,6 +1700,26 @@ func (rc *GPURenderContext) syncTextAtlases() error {
 
 		atlasSize := uint32(size) //nolint:gosec // atlas size always fits uint32
 
+		// Fast path: reuse the existing atlas texture when the page size is
+		// unchanged. Dirty pages previously destroyed and recreated the GPU
+		// texture on every sync — a full 2048² allocation per text frame.
+		if s.sharedAtlasTex != nil && s.sharedAtlasView != nil && s.sharedAtlasSize == size {
+			if err := s.queue.WriteTexture(
+				&wgpu.ImageCopyTexture{Texture: s.sharedAtlasTex, MipLevel: 0},
+				rgbaData,
+				&wgpu.ImageDataLayout{
+					Offset:       0,
+					BytesPerRow:  atlasSize * 4,
+					RowsPerImage: atlasSize,
+				},
+				&wgpu.Extent3D{Width: atlasSize, Height: atlasSize, DepthOrArrayLayers: 1},
+			); err != nil {
+				return fmt.Errorf("re-upload atlas texture %d: %w", idx, err)
+			}
+			s.textEngine.MarkClean(idx)
+			continue
+		}
+
 		tex, err := s.device.CreateTexture(&wgpu.TextureDescriptor{
 			Label:         fmt.Sprintf("msdf_atlas_%d", idx),
 			Size:          wgpu.Extent3D{Width: atlasSize, Height: atlasSize, DepthOrArrayLayers: 1},
@@ -1748,6 +1768,7 @@ func (rc *GPURenderContext) syncTextAtlases() error {
 		}
 		s.sharedAtlasTex = tex
 		s.sharedAtlasView = view
+		s.sharedAtlasSize = size
 		s.textEngine.MarkClean(idx)
 	}
 	return nil
