@@ -1,0 +1,19 @@
+# Hand-authored UAX #9 bidi fixtures.
+# Format: <LTR|RTL>|<paragraph>
+# Each line is laid out and compared against the rule-L2 reference order.
+LTR|Hello مرحبا World
+RTL|مرحبا Hello World
+LTR|مكتب 42 شارع
+RTL|السعر 123 دولار
+LTR|שלום! מה קורה?
+RTL|מחיר: 100
+LTR|عربي (abc) نص
+RTL|אב(גד)קו
+LTR|abc 123 def 456
+RTL|اشتريت 5 كتب
+LTR|a‪b‫c‬d⁩e
+RTL|⁦مرحبا⁩ ثم hello
+LTR|price 3.14 and 2.71
+RTL|مرحبا 3.14 وداعا
+LTR|Hello (world) مرحبا
+RTL|نص (عربي) مختلط

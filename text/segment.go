@@ -3,7 +3,7 @@ package text
 import (
 	"unicode"
 
-	"golang.org/x/text/unicode/bidi"
+	bidix "github.com/gogpu/gg/internal/bidi"
 )
 
 // Segment represents a contiguous run of text with the same direction and script.
@@ -58,32 +58,21 @@ func (s *BuiltinSegmenter) computeBidiLevels(text string) []int {
 	runes := []rune(text)
 	levels := make([]int, len(runes))
 
-	var defaultDir bidi.Direction
-	if s.BaseDirection == DirectionRTL {
-		defaultDir = bidi.RightToLeft
-	} else {
-		defaultDir = bidi.Neutral
+	// Use the full UAX #9 engine (numeric embedding levels, rules
+	// P1–I2 + bracket rule N0) so segmentation and the layout L2 pass
+	// share one consistent level assignment. The previous implementation
+	// only saw per-run parity (0/1) from x/text's Ordering, which loses
+	// nested levels such as level 2 inside an RTL paragraph.
+	base := bidix.DirectionDefault
+	switch s.BaseDirection {
+	case DirectionRTL:
+		base = bidix.DirectionRightToLeft
+	case DirectionLTR:
+		base = bidix.DirectionLeftToRight
 	}
-
-	p := bidi.Paragraph{}
-	_, _ = p.SetString(text, bidi.DefaultDirection(defaultDir))
-
-	ordering, err := p.Order()
-	if err != nil {
-		return levels
-	}
-
-	// run.Pos() returns RUNE indices (start, end inclusive)
-	for i := 0; i < ordering.NumRuns(); i++ {
-		run := ordering.Run(i)
-		startRune, endRune := run.Pos()
-		runLevel := 0
-		if run.Direction() == bidi.RightToLeft {
-			runLevel = 1
-		}
-		for j := startRune; j <= endRune && j < len(levels); j++ {
-			levels[j] = runLevel
-		}
+	resolver := bidix.NewResolver(text, base)
+	for i := range runes {
+		levels[i] = resolver.LevelAt(i)
 	}
 
 	return levels

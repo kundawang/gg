@@ -33,7 +33,13 @@ Bidi/Script  Cache    Lines    ┌────┴────┐
 
 ### Bidi/Script Segmentation (v0.10.0)
 - **25+ Unicode scripts** — Latin, Arabic, Hebrew, Han, Cyrillic, Thai, etc.
-- **Full Unicode Bidi Algorithm** — Via golang.org/x/text/unicode/bidi
+- **Full Unicode Bidi Algorithm (UAX #9)** — Vendored engine in
+  `internal/bidi` (derived from `golang.org/x/text/unicode/bidi`) exposing the
+  numeric embedding levels needed for rule-L2 visual reordering; validated
+  against the official `BidiCharacterTest.txt` conformance suite
+- **Visual reordering** — Mixed-direction runs and their glyphs are
+  repositioned in visual order while clusters, advances, faces and source
+  text indices are preserved
 - **Script inheritance** — Common/Inherited characters resolved from context
 
 ### Multi-line Layout (v0.10.0+)
@@ -217,7 +223,9 @@ type Line struct {
 ## Dependencies
 
 - Pure Go binary font parsing (no external deps)
-- `golang.org/x/text/unicode/bidi` — Unicode Bidirectional Algorithm
+- UAX #9 bidirectional engine — vendored, self-contained copy in
+  `internal/bidi` (production code needs no external bidi dependency);
+  `golang.org/x/text/unicode/bidi` is used only by parity/conformance tests
 - Pure Go GSUB/GPOS shaping (no external deps)
 
 ## Subpackages

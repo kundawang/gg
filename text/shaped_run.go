@@ -24,6 +24,18 @@ type ShapedRun struct {
 
 	// Size is the font size in pixels.
 	Size float64
+
+	// BidiLevel is the resolved UAX #9 embedding level of the run.
+	// Even levels render left-to-right, odd levels right-to-left.
+	// Zero for runs created without bidi resolution.
+	BidiLevel int
+
+	// RuneStart and RuneEnd are the half-open rune-index range of the
+	// source paragraph covered by this run (before X9 control filtering).
+	// Used by the UAX #9 L2 reordering pass. Both are zero for runs
+	// created without bidi resolution.
+	RuneStart int
+	RuneEnd   int
 }
 
 // Width returns the total width of the run.

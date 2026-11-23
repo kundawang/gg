@@ -250,59 +250,43 @@ func layoutParagraph(para string, face Face, opts LayoutOptions, metrics Metrics
 		return nil
 	}
 
-	// Shape each segment
-	runs := shapeSegments(segments, face, metrics)
-
-	// If no wrapping needed or WrapNone, return as single line
-	if opts.MaxWidth <= 0 || opts.WrapMode == WrapNone {
-		return []Line{createLine(runs)}
+	// Resolve full UAX #9 numeric levels (P1–I2, N0) for the paragraph and
+	// shape each segment with its rune range and level attached.
+	pb := resolveParagraphLevels(para, opts.Direction)
+	runs := shapeBidiSegments(pb, segments, face, metrics)
+	if len(runs) == 0 {
+		return nil
 	}
 
-	// Wrap lines at MaxWidth using the specified wrap mode
-	return wrapLinesWithMode(runs, para, opts.MaxWidth, opts.WrapMode, metrics)
+	// If no wrapping needed or WrapNone, return as single visually ordered line
+	if opts.MaxWidth <= 0 || opts.WrapMode == WrapNone {
+		line := createBidiLine(runs)
+		reorderLineVisual(&line, pb)
+		return []Line{line}
+	}
+
+	// Wrap lines at MaxWidth using the specified wrap mode, then apply the
+	// UAX #9 L2 visual reordering independently to each resulting line.
+	lines := wrapBidiLines(runs, para, opts.MaxWidth, opts.WrapMode, metrics, pb)
+	for i := range lines {
+		reorderLineVisual(&lines[i], pb)
+	}
+	return lines
 }
 
-// shapeSegments shapes each segment and returns ShapedRuns.
-func shapeSegments(segments []Segment, face Face, metrics Metrics) []ShapedRun {
-	runs := make([]ShapedRun, 0, len(segments))
-	size := face.Size()
-	var xOffset float64
-
-	for _, seg := range segments {
-		glyphs := Shape(seg.Text, face)
-		if len(glyphs) == 0 {
-			continue
-		}
-
-		// Adjust glyph positions by xOffset
-		for i := range glyphs {
-			glyphs[i].X += xOffset
-			// Adjust cluster indices to be relative to paragraph start
-			glyphs[i].Cluster += seg.Start
-		}
-
-		// Calculate run advance
-		var advance float64
-		if len(glyphs) > 0 {
-			lastGlyph := &glyphs[len(glyphs)-1]
-			advance = lastGlyph.X - xOffset + lastGlyph.XAdvance
-		}
-
-		run := ShapedRun{
-			Glyphs:    glyphs,
-			Advance:   advance,
-			Ascent:    metrics.Ascent,
-			Descent:   metrics.Descent,
-			Direction: seg.Direction,
-			Face:      face,
-			Size:      size,
-		}
-		runs = append(runs, run)
-
-		xOffset += advance
+// plainRuns strips the internal bidi rune-range tags for APIs that consume
+// ordinary ShapedRun slices.
+func plainRuns(runs []bidiShapedRun) []ShapedRun {
+	out := make([]ShapedRun, len(runs))
+	for i := range runs {
+		out[i] = runs[i].ShapedRun
 	}
+	return out
+}
 
-	return runs
+// createBidiLine creates a Line from bidi-tagged runs in logical order.
+func createBidiLine(runs []bidiShapedRun) Line {
+	return createLine(plainRuns(runs))
 }
 
 // createLine creates a Line from runs.
@@ -335,15 +319,19 @@ type glyphInfo struct {
 	isBreak bool
 }
 
-// wrapLinesWithMode wraps runs into lines at maxWidth using the specified wrap mode.
-func wrapLinesWithMode(runs []ShapedRun, text string, maxWidth float64, mode WrapMode, metrics Metrics) []Line {
+// wrapBidiLines wraps bidi-tagged runs into lines at maxWidth. It mirrors
+// wrapLinesWithMode but preserves UAX #9 levels on sub-runs so that every
+// produced line can be visually reordered independently.
+func wrapBidiLines(runs []bidiShapedRun, text string, maxWidth float64, mode WrapMode, metrics Metrics, pb *paragraphBidi) []Line {
 	if len(runs) == 0 {
 		return nil
 	}
 
+	plain := plainRuns(runs)
+
 	// Flatten all glyphs with their run info for easier processing
 	infos := make([]glyphInfo, 0)
-	for runIdx, run := range runs {
+	for runIdx, run := range plain {
 		for _, g := range run.Glyphs {
 			infos = append(infos, glyphInfo{
 				glyph:   g,
@@ -393,7 +381,7 @@ func wrapLinesWithMode(runs []ShapedRun, text string, maxWidth float64, mode Wra
 		}
 
 		// Create line from lineStart to breakAt
-		line := createLineFromGlyphs(infos[lineStart:breakAt], runs, startX, metrics)
+		line := createLineFromGlyphsBidi(infos[lineStart:breakAt], plain, startX, metrics, pb)
 		lines = append(lines, line)
 
 		// Start new line
@@ -406,7 +394,7 @@ func wrapLinesWithMode(runs []ShapedRun, text string, maxWidth float64, mode Wra
 
 	// Add remaining glyphs as final line
 	if lineStart < len(infos) {
-		line := createLineFromGlyphs(infos[lineStart:], runs, startX, metrics)
+		line := createLineFromGlyphsBidi(infos[lineStart:], plain, startX, metrics, pb)
 		lines = append(lines, line)
 	}
 
@@ -442,8 +430,12 @@ func markBreakOpportunities(infos []glyphInfo) {
 	}
 }
 
-// createLineFromGlyphs creates a Line from a slice of glyph infos.
-func createLineFromGlyphs(infos []glyphInfo, runs []ShapedRun, startX float64, metrics Metrics) Line {
+// createLineFromGlyphsBidi is the bidi-aware counterpart of the legacy
+// glyph-slice line builder: sub-runs inherit the resolved level and rune
+// range of their source run so the L2 pass sees complete metadata. The
+// optional mapper (nil tolerated) narrows each wrapped sub-run's rune range
+// to the glyphs it actually contains on that line.
+func createLineFromGlyphsBidi(infos []glyphInfo, runs []ShapedRun, startX float64, metrics Metrics, mapper subRunRuneMapper) Line {
 	line := Line{
 		Runs:    make([]ShapedRun, 0),
 		Glyphs:  make([]ShapedGlyph, 0, len(infos)),
@@ -455,9 +447,10 @@ func createLineFromGlyphs(infos []glyphInfo, runs []ShapedRun, startX float64, m
 		return line
 	}
 
-	// Collect glyphs and adjust X positions
+	// Track runs; each sub-run derives its own rune span from the glyphs
+	// it actually contains (wrapping can split a source run across lines),
+	// which is required for correct per-line rule-L2 reordering.
 	currentRunIdx := -1
-	var currentRun *ShapedRun
 
 	for _, info := range infos {
 		// Clone glyph and adjust X position to start from 0
@@ -470,22 +463,38 @@ func createLineFromGlyphs(infos []glyphInfo, runs []ShapedRun, startX float64, m
 		if info.runIdx != currentRunIdx && info.runIdx < len(runs) {
 			currentRunIdx = info.runIdx
 			srcRun := &runs[info.runIdx]
-			// Create a new run for this line
-			currentRun = &ShapedRun{
+			line.Runs = append(line.Runs, ShapedRun{
 				Glyphs:    make([]ShapedGlyph, 0),
 				Direction: srcRun.Direction,
 				Face:      srcRun.Face,
 				Size:      srcRun.Size,
 				Ascent:    srcRun.Ascent,
 				Descent:   srcRun.Descent,
-			}
-			line.Runs = append(line.Runs, *currentRun)
+				BidiLevel: srcRun.BidiLevel,
+				RuneStart: srcRun.RuneStart,
+				RuneEnd:   srcRun.RuneEnd,
+			})
 		}
 
-		// Add glyph to current run
 		if len(line.Runs) > 0 {
 			lastRunIdx := len(line.Runs) - 1
 			line.Runs[lastRunIdx].Glyphs = append(line.Runs[lastRunIdx].Glyphs, g)
+		}
+	}
+
+	// Narrow every sub-run's rune range to the span covered by its own
+	// glyph clusters, using the paragraph byte->rune map when available.
+	if mapper != nil {
+		for i := range line.Runs {
+			run := &line.Runs[i]
+			if len(run.Glyphs) == 0 {
+				continue
+			}
+			firstByte := run.Glyphs[0].Cluster
+			lastByte := run.Glyphs[len(run.Glyphs)-1].Cluster
+			run.RuneStart = mapper.runeIndexForByteOffset(firstByte)
+			// RuneEnd is exclusive.
+			run.RuneEnd = mapper.runeIndexForByteOffset(lastByte) + 1
 		}
 	}
 
@@ -495,7 +504,6 @@ func createLineFromGlyphs(infos []glyphInfo, runs []ShapedRun, startX float64, m
 		line.Width = lastGlyph.X + lastGlyph.XAdvance
 	}
 
-	// Update run advances
 	for i := range line.Runs {
 		run := &line.Runs[i]
 		if len(run.Glyphs) > 0 {
