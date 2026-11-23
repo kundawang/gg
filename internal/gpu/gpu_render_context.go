@@ -4,6 +4,8 @@ package gpu
 
 import (
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/gogpu/gg"
@@ -185,6 +187,13 @@ type GPURenderContext struct {
 	// Reset and reused across strokes within a frame; same pattern as
 	// SoftwareRenderer.scratchStrokePath (Skia fOuter.reset()).
 	scratchStrokePath *gg.Path
+
+	// closed is set by Close. Queue and Flush operations on a closed context
+	// return gg.ErrAcceleratorClosed so no command is recorded into, or
+	// dispatched from, a context whose resources were already released.
+	// Atomic so concurrent Close calls (and queue-vs-Close checks) are safe.
+	closed    atomic.Bool
+	closeOnce sync.Once
 }
 
 // DrawRecording is an immutable snapshot of draw commands (Skia Recording pattern).
@@ -351,6 +360,9 @@ func (rc *GPURenderContext) SceneStats() gg.SceneStats {
 // properties (transform, color, atlas, MSDF parameters) are coalesced into a
 // single batch to minimize GPU draw calls (ADR-031).
 func (rc *GPURenderContext) QueueText(target gg.GPURenderTarget, batch TextBatch) {
+	if rc.closed.Load() {
+		return
+	}
 	if rc.hasPendingTarget && !sameTarget(&rc.pendingTarget, &target) {
 		if fErr := rc.Flush(rc.pendingTarget); fErr != nil {
 			slogger().Warn("auto-flush failed", "err", fErr)
@@ -393,6 +405,9 @@ func (rc *GPURenderContext) QueueImageDraw(target gg.GPURenderTarget, pixelData 
 	dstX, dstY, dstW, dstH, opacity float32, viewportW, viewportH uint32,
 	u0, v0, u1, v1 float32,
 ) {
+	if rc.closed.Load() {
+		return
+	}
 	cmd := ImageDrawCommand{
 		PixelData:      pixelData,
 		GenerationID:   genID,
@@ -445,6 +460,9 @@ func (rc *GPURenderContext) queueImageCmd(target gg.GPURenderTarget, cmd ImageDr
 func (rc *GPURenderContext) QueueBaseLayer(target gg.GPURenderTarget, view gpucontext.TextureView,
 	dstX, dstY, dstW, dstH, opacity float32, vpW, vpH uint32,
 ) {
+	if rc.closed.Load() {
+		return
+	}
 	cmd := drawCommand{
 		kind: drawCmdBaseLayer,
 		gpuTexCmd: GPUTextureDrawCommand{
@@ -475,6 +493,9 @@ func (rc *GPURenderContext) QueueBaseLayer(target gg.GPURenderTarget, view gpuco
 func (rc *GPURenderContext) QueueGPUTextureDraw(target gg.GPURenderTarget, view gpucontext.TextureView,
 	dstX, dstY, dstW, dstH, opacity float32, vpW, vpH uint32,
 ) {
+	if rc.closed.Load() {
+		return
+	}
 	if rc.hasPendingTarget && !sameTarget(&rc.pendingTarget, &target) {
 		if fErr := rc.Flush(rc.pendingTarget); fErr != nil {
 			slogger().Warn("auto-flush failed", "err", fErr)
@@ -499,6 +520,9 @@ func (rc *GPURenderContext) QueueGPUTextureDraw(target gg.GPURenderTarget, view 
 // properties (transform, color, LCD mode, atlas page) are coalesced into a
 // single batch to minimize GPU draw calls (ADR-031).
 func (rc *GPURenderContext) QueueGlyphMask(target gg.GPURenderTarget, batch GlyphMaskBatch) {
+	if rc.closed.Load() {
+		return
+	}
 	if rc.hasPendingTarget && !sameTarget(&rc.pendingTarget, &target) {
 		if fErr := rc.Flush(rc.pendingTarget); fErr != nil {
 			slogger().Warn("auto-flush failed", "err", fErr)
@@ -542,6 +566,10 @@ func (rc *GPURenderContext) DrawText(target gg.GPURenderTarget, face any, s stri
 		return gg.ErrFallbackToCPU
 	}
 
+	if rc.closed.Load() {
+		return gg.ErrAcceleratorClosed
+	}
+
 	rc.sceneStats.TextCount++
 
 	if !rc.shared.gpuReady {
@@ -576,6 +604,10 @@ func (rc *GPURenderContext) DrawGlyphMaskText(target gg.GPURenderTarget, face an
 	textFace, ok := face.(text.Face)
 	if !ok || textFace == nil {
 		return gg.ErrFallbackToCPU
+	}
+
+	if rc.closed.Load() {
+		return gg.ErrAcceleratorClosed
 	}
 
 	rc.sceneStats.TextCount++
@@ -614,6 +646,10 @@ func (rc *GPURenderContext) DrawGlyphMaskTextAliased(target gg.GPURenderTarget, 
 	textFace, ok := face.(text.Face)
 	if !ok || textFace == nil {
 		return gg.ErrFallbackToCPU
+	}
+
+	if rc.closed.Load() {
+		return gg.ErrAcceleratorClosed
 	}
 
 	rc.sceneStats.TextCount++
@@ -696,6 +732,9 @@ func (rc *GPURenderContext) drawShapedGlyphMaskText(target gg.GPURenderTarget, f
 // The path is cloned at queue time so the caller can reuse or mutate it.
 // At Flush time, the path is dispatched to either GPU (convex/stencil) or CPU.
 func (rc *GPURenderContext) FillPath(target gg.GPURenderTarget, path *gg.Path, paint *gg.Paint) error {
+	if rc.closed.Load() {
+		return gg.ErrAcceleratorClosed
+	}
 	rc.sceneStats.PathCount++
 	rc.sceneStats.ShapeCount++
 
@@ -741,6 +780,9 @@ func (rc *GPURenderContext) FillPath(target gg.GPURenderTarget, path *gg.Path, p
 // StrokePath queues a stroked path as a backend-agnostic draw command (ADR-051).
 // Dashed strokes fall back to CPU. The path is cloned at queue time.
 func (rc *GPURenderContext) StrokePath(target gg.GPURenderTarget, path *gg.Path, paint *gg.Paint) error {
+	if rc.closed.Load() {
+		return gg.ErrAcceleratorClosed
+	}
 	if paint.IsDashed() {
 		return gg.ErrFallbackToCPU
 	}
@@ -795,6 +837,9 @@ func (rc *GPURenderContext) StrokePath(target gg.GPURenderTarget, path *gg.Path,
 // or CPU SoftwareRenderer depending on strategy. This ensures offscreen targets
 // get isolated rendering regardless of backend.
 func (rc *GPURenderContext) FillShape(target gg.GPURenderTarget, shape gg.DetectedShape, paint *gg.Paint) error {
+	if rc.closed.Load() {
+		return gg.ErrAcceleratorClosed
+	}
 	rc.sceneStats.ShapeCount++
 
 	// Compute mode delegates directly to VelloAccelerator (separate pipeline).
@@ -834,6 +879,9 @@ func (rc *GPURenderContext) FillShape(target gg.GPURenderTarget, shape gg.Detect
 // Thin strokes (< 2px) fall back to CPU geometric expansion because SDF annular
 // ring is thinner than the smoothstep AA zone (ADR-040).
 func (rc *GPURenderContext) StrokeShape(target gg.GPURenderTarget, shape gg.DetectedShape, paint *gg.Paint) error {
+	if rc.closed.Load() {
+		return gg.ErrAcceleratorClosed
+	}
 	rc.sceneStats.ShapeCount++
 
 	// Thin strokes fall back to geometric expansion regardless of strategy.
@@ -893,6 +941,9 @@ func selectBaseLayer(draws []drawCommand, frameRendered bool) *GPUTextureDrawCom
 
 // Flush dispatches all pending commands for this context via the render session.
 func (rc *GPURenderContext) Flush(target gg.GPURenderTarget) error { //nolint:cyclop,gocognit,gocyclo,funlen // sequential resource setup + group dispatch
+	if rc.closed.Load() {
+		return gg.ErrAcceleratorClosed
+	}
 	// Dispatch backend-agnostic draw commands (ADR-051).
 	// rasterAtlas: mixed CPU/GPU dispatch — shape commands are CPU-dispatched
 	// immediately; non-shape commands (images, GPU textures, base layers)
@@ -1026,6 +1077,7 @@ func (rc *GPURenderContext) Flush(target gg.GPURenderTarget) error { //nolint:cy
 			total += len(ownedGroups[i].SDFShapes) + len(ownedGroups[i].ConvexCommands) + len(ownedGroups[i].StencilPaths) +
 				len(ownedGroups[i].ImageCommands) + len(ownedGroups[i].TextBatches) + len(ownedGroups[i].GlyphMaskBatches)
 		}
+		err = ClassifyGPUError(err)
 		slogger().Warn("render session error",
 			"groups", len(ownedGroups), "totalItems", total, "err", err)
 	}
@@ -1605,6 +1657,14 @@ func (rc *GPURenderContext) CreateOffscreenTexture(w, h int) (gpucontext.Texture
 // Close releases this context's GPU resources. Shared resources are NOT
 // released — they are owned by GPUShared.
 func (rc *GPURenderContext) Close() {
+	rc.closeOnce.Do(func() {
+		rc.closed.Store(true)
+		rc.closeResources()
+	})
+}
+
+// closeResources releases this context's GPU resources. Called once by Close.
+func (rc *GPURenderContext) closeResources() {
 	if rc.session != nil {
 		if tp := rc.session.TextPipelineRef(); tp != nil {
 			tp.Destroy()

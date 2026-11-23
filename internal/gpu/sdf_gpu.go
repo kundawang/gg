@@ -32,6 +32,9 @@ type SDFAccelerator struct {
 	// When gg.Context does not have its own GPURenderContext (legacy path),
 	// operations are routed through this default context.
 	defaultCtx *GPURenderContext
+
+	// closed is set by Close; guarded by mu section of the struct comment.
+	closed bool
 }
 
 var _ gg.GPUAccelerator = (*SDFAccelerator)(nil)
@@ -176,19 +179,31 @@ func (a *SDFAccelerator) SceneStats() gg.SceneStats {
 }
 
 // Init initializes the accelerator. GPU device initialization is deferred.
+//
+// Init may be called again after Close (ReinitAccelerator): a fresh GPUShared
+// and default render context are created so the accelerator becomes usable
+// without re-registering.
 func (a *SDFAccelerator) Init() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.shared == nil {
 		a.shared = NewGPUShared()
+	} else {
+		a.shared.ResetClosed()
 	}
+	a.closed = false
 	return nil
 }
 
-// Close releases all GPU resources held by the accelerator.
+// Close releases all GPU resources held by the accelerator. Idempotent: the
+// second and later calls are no-ops.
 func (a *SDFAccelerator) Close() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.closed {
+		return
+	}
+	a.closed = true
 	if a.defaultCtx != nil {
 		a.defaultCtx.Close()
 		a.defaultCtx = nil

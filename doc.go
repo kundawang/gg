@@ -56,6 +56,22 @@
 //   - Tier 6: Glyph mask cache (hinted bitmap text)
 //   - CPU: Skia AAA pixel-perfect rasterizer (analytic anti-aliasing)
 //
+// # GPU Lifecycle and CPU Fallback
+//
+// GPU use is opportunistic and observable. A GPU operation that cannot run on
+// the GPU is resolved on the CPU only under an explicit [FallbackPolicy]:
+//
+//   - [FallbackOnError] (default): any GPU error may be rendered on the CPU.
+//     The first error is recorded, not swallowed: inspect it with
+//     [Context.GPUStatus] or [AcceleratorSnapshot].
+//   - [FallbackOnUnsupported]: only ErrFallbackToCPU may fall back; any other
+//     GPU error is returned to the caller.
+//
+// A device lost mid-frame is recorded through [ReportAcceleratorDeviceLost];
+// [Accelerator] then returns nil so no further GPU resource is touched until a
+// successful [RegisterAccelerator] or [ReinitAccelerator]. Close is idempotent
+// and safe under concurrent use for both [Context] and [CloseAccelerator].
+//
 // # Compositing
 //
 // 29 W3C blend modes for direct Fill/Stroke operations:

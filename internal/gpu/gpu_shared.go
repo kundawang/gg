@@ -109,6 +109,7 @@ type GPUShared struct {
 	softwareMode   bool              // true when software/CPU adapter detected (informational, does not disable GPU)
 	strategy       gpuRenderStrategy // auto-detected rendering strategy (Skia PathRendererStrategy pattern)
 	externalDevice bool              // true when using shared device (don't destroy on Close)
+	closed         bool              // true after Close released resources
 }
 
 // NewGPUShared creates a new shared GPU resource holder. GPU initialization
@@ -132,6 +133,21 @@ func (s *GPUShared) NewRenderContext() *GPURenderContext {
 		shared:    s,
 		antiAlias: true,
 	}
+}
+
+// IsClosed reports whether Close has released this holder's resources.
+func (s *GPUShared) IsClosed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed
+}
+
+// ResetClosed clears the closed flag. Called by an accelerator re-initializing
+// after Close (ReinitAccelerator) so the holder can lazily rebuild its device.
+func (s *GPUShared) ResetClosed() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closed = false
 }
 
 // IsReady reports whether the GPU shape/text pipelines are initialized.
@@ -191,6 +207,9 @@ func (s *GPUShared) SetForceSDF(force bool) {
 // SwiftShader for testing. Capability differences are handled via probing
 // (e.g., MSAA fallback to 1x), not blanket disabling.
 func (s *GPUShared) SetDeviceProvider(provider gpucontext.DeviceProvider) error {
+	if provider == nil {
+		return gg.ErrNilDeviceProvider
+	}
 	if adapter := provider.Adapter(); !adapter.IsNil() {
 		wgpuAdapter := wgpu.AdapterFromHandle(adapter)
 		if wgpuAdapter != nil && wgpuAdapter.Info().DeviceType == gputypes.DeviceTypeCPU {
@@ -306,10 +325,18 @@ func (s *GPUShared) SetTexturePoolBudget(mb int) {
 }
 
 // Close releases all shared GPU resources. After this call, GPU rendering
-// is no longer possible. Idempotent.
+// is no longer possible. Idempotent — repeated calls are no-ops and never
+// release the same GPU object twice.
+//
+// Close does not mark the shared holder permanently dead: ReinitAccelerator
+// calls Init again on the owning accelerator, which re-creates a GPUShared.
 func (s *GPUShared) Close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
+	s.closed = true
 
 	s.textEngine = nil
 	if s.sharedAtlasView != nil {
@@ -413,6 +440,9 @@ func resolveSampleCount(device *wgpu.Device) uint32 {
 // ensureGPU lazily initializes a standalone GPU device if no shared device
 // was provided. Must be called with s.mu held.
 func (s *GPUShared) ensureGPU() error {
+	if s.closed {
+		return gg.ErrAcceleratorClosed
+	}
 	if s.device != nil {
 		return nil
 	}

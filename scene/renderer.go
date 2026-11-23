@@ -2,6 +2,7 @@ package scene
 
 import (
 	"context"
+	"errors"
 	"image"
 	"runtime"
 	"sync"
@@ -164,13 +165,31 @@ type Renderer struct {
 	tileSize int
 	workers  int
 
-	// Font registry for TagText resolution (set per-render from Scene).
-	fontRegistry map[uint64]*text.FontSource
+	// perTile is the per-render state (font registry, current transform).
+	// It is created fresh for each render call, so concurrent Render calls on
+	// the same Renderer do not race on it. Tile-level state that used to live
+	// on the Renderer (fontRegistry) is carried by a renderJob instead.
+	// (See renderJob below.)
 
 	// Statistics
 	stats     RenderStats
 	statsMu   sync.RWMutex
 	lastFrame time.Time
+
+	// closed is set by Close. Renders on a closed Renderer return
+	// ErrRendererClosed instead of touching released pool/grid resources.
+	closeMu sync.Mutex
+	closed  bool
+}
+
+// ErrRendererClosed is returned by Render calls on a Renderer after Close.
+var ErrRendererClosed = errors.New("scene: renderer is closed")
+
+// renderJob carries the immutable per-render state shared by all tiles of a
+// single Render call. Keeping it out of the Renderer makes concurrent Render
+// calls safe: each call has its own job.
+type renderJob struct {
+	fontRegistry map[uint64]*text.FontSource
 }
 
 // RenderStats contains performance statistics for a render operation.
@@ -270,7 +289,11 @@ func NewRenderer(width, height int, opts ...RendererOption) *Renderer {
 // renderGPU renders the scene through the GPU accelerator via GPUSceneRenderer.
 // Creates a temporary gg.Context backed by the target pixmap, renders the scene
 // through it (GPU shapes → FlushGPU → readback to pixmap), returns nil on success.
-func (r *Renderer) renderGPU(target *gg.Pixmap, scene *Scene) error {
+//
+// The render is canceled cooperatively: the per-call gg.Context is closed
+// (flushing nothing further) and ctx.Err() is returned when ctx is done. The
+// caller may then fall back to the CPU path, which honors the same ctx.
+func (r *Renderer) renderGPU(ctx context.Context, target *gg.Pixmap, scene *Scene) error {
 	dc := gg.NewContextForPixmap(target)
 	if dc == nil {
 		return gg.ErrFallbackToCPU
@@ -278,7 +301,7 @@ func (r *Renderer) renderGPU(target *gg.Pixmap, scene *Scene) error {
 	defer func() { _ = dc.Close() }()
 
 	gpuR := NewGPUSceneRenderer(dc)
-	if err := gpuR.RenderScene(scene); err != nil {
+	if err := gpuR.RenderSceneContext(ctx, scene); err != nil {
 		return err
 	}
 	return dc.FlushGPU()
@@ -309,12 +332,27 @@ func (r *Renderer) RenderWithContext(ctx context.Context, target *gg.Pixmap, sce
 	default:
 	}
 
+	if err := r.checkOpen(); err != nil {
+		return err
+	}
+
 	// GPU fast path: if a GPU accelerator is registered, render through
 	// GPUSceneRenderer which decodes scene commands into gg.Context GPU calls.
-	// The gg.Context handles GPU→CPU fallback automatically per-shape.
+	//
+	// A GPU attempt that succeeds returns immediately. It is retried on the CPU
+	// only when the failure permits it under the active FallbackPolicy; a
+	// cancellation (ctx.Err()) and a strict-policy GPU failure are returned to
+	// the caller instead of being masked by a CPU render.
 	if gg.Accelerator() != nil {
-		if err := r.renderGPU(target, scene); err == nil {
+		err := r.renderGPU(ctx, target, scene)
+		if err == nil {
 			return nil
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if !gg.AllowCPUFallback(err) && !errors.Is(err, gg.ErrFallbackToCPU) {
+			return err
 		}
 	}
 
@@ -330,7 +368,7 @@ func (r *Renderer) RenderWithContext(ctx context.Context, target *gg.Pixmap, sce
 	startEncode := time.Now()
 	enc := scene.Encoding()
 	images := scene.Images()
-	r.fontRegistry = scene.FontRegistry()
+	job := &renderJob{fontRegistry: scene.FontRegistry()}
 	encodeTime := time.Since(startEncode)
 
 	// Check for cancellation after encoding
@@ -346,7 +384,7 @@ func (r *Renderer) RenderWithContext(ctx context.Context, target *gg.Pixmap, sce
 
 	// Render tiles in parallel with context
 	startRaster := time.Now()
-	if err := r.renderTilesWithContext(ctx, tiles, enc, target, images); err != nil {
+	if err := r.renderTilesWithContext(ctx, job, tiles, enc, target, images); err != nil {
 		return err
 	}
 	rasterTime := time.Since(startRaster)
@@ -455,6 +493,10 @@ func (r *Renderer) RenderDirtyWithContext(ctx context.Context, target *gg.Pixmap
 	r.stats = RenderStats{}
 	r.statsMu.Unlock()
 
+	if err := r.checkOpen(); err != nil {
+		return err
+	}
+
 	// Use provided dirty region or fall back to internal tracking
 	dirtyRegion := dirty
 	if dirtyRegion == nil {
@@ -465,7 +507,7 @@ func (r *Renderer) RenderDirtyWithContext(ctx context.Context, target *gg.Pixmap
 	startEncode := time.Now()
 	enc := scene.Encoding()
 	images := scene.Images()
-	r.fontRegistry = scene.FontRegistry()
+	job := &renderJob{fontRegistry: scene.FontRegistry()}
 	encodeTime := time.Since(startEncode)
 
 	// Check for cancellation after encoding
@@ -493,7 +535,7 @@ func (r *Renderer) RenderDirtyWithContext(ctx context.Context, target *gg.Pixmap
 
 	// Render dirty tiles in parallel with context
 	startRaster := time.Now()
-	if err := r.renderTilesWithContext(ctx, tiles, enc, target, images); err != nil {
+	if err := r.renderTilesWithContext(ctx, job, tiles, enc, target, images); err != nil {
 		return err
 	}
 	rasterTime := time.Since(startRaster)
@@ -520,7 +562,7 @@ func (r *Renderer) RenderDirtyWithContext(ctx context.Context, target *gg.Pixmap
 
 // renderTilesWithContext renders the scene encoding to the specified tiles in parallel
 // with cancellation support.
-func (r *Renderer) renderTilesWithContext(ctx context.Context, tiles []*parallel.Tile, enc *Encoding, target *gg.Pixmap, images []*Image) error {
+func (r *Renderer) renderTilesWithContext(ctx context.Context, job *renderJob, tiles []*parallel.Tile, enc *Encoding, target *gg.Pixmap, images []*Image) error {
 	if len(tiles) == 0 || enc == nil || enc.IsEmpty() {
 		return nil
 	}
@@ -547,7 +589,7 @@ func (r *Renderer) renderTilesWithContext(ctx context.Context, tiles []*parallel
 			default:
 			}
 		}
-		r.renderTile(tiles[i], enc, target, images)
+		r.renderTile(job, tiles[i], enc, target, images)
 	})
 
 	// Check if context was canceled during execution
@@ -560,7 +602,7 @@ func (r *Renderer) renderTilesWithContext(ctx context.Context, tiles []*parallel
 }
 
 // renderTile renders the scene encoding to a single tile.
-func (r *Renderer) renderTile(tile *parallel.Tile, enc *Encoding, _ *gg.Pixmap, images []*Image) {
+func (r *Renderer) renderTile(job *renderJob, tile *parallel.Tile, enc *Encoding, _ *gg.Pixmap, images []*Image) {
 	if tile == nil || enc == nil {
 		return
 	}
@@ -591,7 +633,7 @@ func (r *Renderer) renderTile(tile *parallel.Tile, enc *Encoding, _ *gg.Pixmap, 
 	dec := r.pool.getDecoder(enc)
 
 	// Render commands using gg.SoftwareRenderer
-	r.executeEncodingOnTile(dec, tile, pm, sr, images)
+	r.executeEncodingOnTile(job, dec, tile, pm, sr, images)
 
 	// Copy rendered pixmap data into the tile buffer.
 	// Pixmap stores premultiplied RGBA, same as tile.Data.
@@ -618,7 +660,7 @@ type tileClipState struct {
 // rasterization to gg.SoftwareRenderer for analytic anti-aliased output.
 //
 //nolint:gocyclo,cyclop,gocognit,funlen // Command interpreter with multiple cases is inherently complex
-func (r *Renderer) executeEncodingOnTile(dec *Decoder, tile *parallel.Tile, pm *gg.Pixmap, sr *gg.SoftwareRenderer, images []*Image) { //nolint:maintidx // tag dispatch across all scene command types
+func (r *Renderer) executeEncodingOnTile(job *renderJob, dec *Decoder, tile *parallel.Tile, pm *gg.Pixmap, sr *gg.SoftwareRenderer, images []*Image) { //nolint:maintidx // tag dispatch across all scene command types
 	// Reusable scene.Path for the decode loop — reset per TagBeginPath instead of allocating.
 	currentPath := r.pool.getScenePath()
 	defer r.pool.putScenePath(currentPath)
@@ -779,7 +821,7 @@ func (r *Renderer) executeEncodingOnTile(dec *Decoder, tile *parallel.Tile, pm *
 
 		case TagText:
 			run, glyphs, _, brush := dec.Text()
-			r.renderTextOnTile(run, glyphs, brush, currentTransform, tileX, tileY, activePM, sr, fillPaint)
+			r.renderTextOnTile(job, run, glyphs, brush, currentTransform, tileX, tileY, activePM, sr, fillPaint)
 
 		case TagSetAntiAlias:
 			aa := dec.AntiAlias()
@@ -891,6 +933,7 @@ func compositePixmaps(dst, src *gg.Pixmap) {
 // glyph outlines and rendering each as a filled path. Uses pre-shaped glyphs
 // from the scene encoding — no re-shaping needed (ADR-022: shape once).
 func (r *Renderer) renderTextOnTile(
+	job *renderJob,
 	run GlyphRunData, glyphs []GlyphEntry, brush Brush,
 	transform Affine, tileX, tileY int,
 	pm *gg.Pixmap, sr *gg.SoftwareRenderer, fillPaint *gg.Paint,
@@ -899,7 +942,7 @@ func (r *Renderer) renderTextOnTile(
 		return
 	}
 
-	source := r.fontRegistry[run.FontSourceID]
+	source := job.fontRegistry[run.FontSourceID]
 	if source == nil {
 		return
 	}
@@ -1610,12 +1653,37 @@ func (r *Renderer) Workers() int {
 // Close releases all resources used by the renderer.
 // The renderer should not be used after Close is called.
 func (r *Renderer) Close() {
+	r.closeMu.Lock()
+	if r.closed {
+		r.closeMu.Unlock()
+		return
+	}
+	r.closed = true
+	r.closeMu.Unlock()
+
 	if r.workerPool != nil {
 		r.workerPool.Close()
 	}
 	if r.tileGrid != nil {
 		r.tileGrid.Close()
 	}
+}
+
+// IsClosed reports whether Close has been called.
+func (r *Renderer) IsClosed() bool {
+	r.closeMu.Lock()
+	defer r.closeMu.Unlock()
+	return r.closed
+}
+
+// checkOpen returns ErrRendererClosed when the Renderer has been closed. It is
+// called before a render touches the worker pool or tile grid, so a render on
+// a closed Renderer fails deterministically instead of using released tiles.
+func (r *Renderer) checkOpen() error {
+	if r.IsClosed() {
+		return ErrRendererClosed
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------

@@ -125,7 +125,7 @@ func (c *Context) DrawString(s string, x, y float64) {
 		c.drawStringAsOutlines(s, x, y)
 	case TextModeBitmap:
 		// Skip GPU entirely, use CPU pipeline directly.
-		c.flushGPUAccelerator()
+		_ = c.flushGPUAccelerator() // CPU text path; a flush error is recorded by the Context
 		c.drawStringCPU(s, x, y)
 	default: // TextModeAuto — current behavior
 		// ADR-027: CJK ≤64px → prefer Tier 6 (bitmap) over MSDF.
@@ -643,7 +643,7 @@ func (c *Context) drawStringCPU(s string, x, y float64) {
 // This is the fast path for identity/translation-only CTMs where no quality loss occurs.
 func (c *Context) drawStringBitmap(s string, x, y float64) {
 	p := c.totalMatrix().TransformPoint(Pt(x, y))
-	c.flushGPUAccelerator()
+	_ = c.flushGPUAccelerator() // CPU text path; a flush error is recorded by the Context
 	face := c.face
 	if c.deviceScale != 1.0 {
 		if source := c.face.Source(); source != nil {
@@ -665,7 +665,7 @@ func (c *Context) drawStringScaled(s string, x, y float64, deviceSize float64) {
 	// Scale deviceSize by deviceScale for actual physical pixel rendering.
 	deviceFace := source.Face(deviceSize * c.deviceScale)
 	p := c.totalMatrix().TransformPoint(Pt(x, y))
-	c.flushGPUAccelerator()
+	_ = c.flushGPUAccelerator() // CPU text path; a flush error is recorded by the Context
 	text.Draw(c.pixmap, s, deviceFace, p.X, p.Y, c.currentColor())
 }
 
@@ -693,7 +693,7 @@ func (c *Context) drawStringCPUAliased(s string, x, y float64) {
 	}
 
 	p := c.totalMatrix().TransformPoint(Pt(x, y))
-	c.flushGPUAccelerator()
+	_ = c.flushGPUAccelerator() // CPU text path; a flush error is recorded by the Context
 
 	face := c.face
 	if c.deviceScale != 1.0 {

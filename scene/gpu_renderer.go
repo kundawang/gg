@@ -1,6 +1,7 @@
 package scene
 
 import (
+	"context"
 	"image"
 
 	"github.com/gogpu/gg"
@@ -26,6 +27,13 @@ import (
 //	err := gpuR.RenderScene(myScene)
 type GPUSceneRenderer struct {
 	dc *gg.Context
+
+	// baseMatrix is the Context transform captured at the start of the current
+	// RenderScene call. It is per-call (the renderer is not shared concurrently).
+	baseMatrix gg.Matrix
+
+	// firstErr records the first draw error of the current RenderScene call.
+	firstErr error
 }
 
 // NewGPUSceneRenderer creates a GPU scene renderer that renders through
@@ -45,8 +53,18 @@ func NewGPUSceneRenderer(dc *gg.Context) *GPUSceneRenderer {
 // boundaries only, ensuring that TagTransform inside a clip region does
 // not accidentally pop the clip's saved state.
 //
-// Returns nil if the scene is empty.
-func (r *GPUSceneRenderer) RenderScene(scene *Scene) error { //nolint:gocyclo,cyclop,funlen,gocognit // tag dispatch across all scene command types
+// Returns nil if the scene is empty. Returns the first draw error otherwise:
+// an operation that the accelerator and the active fallback policy could not
+// render is surfaced instead of being silently skipped.
+func (r *GPUSceneRenderer) RenderScene(scene *Scene) error {
+	return r.RenderSceneContext(context.Background(), scene)
+}
+
+// RenderSceneContext is RenderScene with cancellation. ctx is checked before
+// each decoded command; when it is done, rendering stops and ctx.Err() is
+// returned. Partial output may remain in the target, so callers should discard
+// or re-render on cancellation.
+func (r *GPUSceneRenderer) RenderSceneContext(ctx context.Context, scene *Scene) error { //nolint:gocyclo,cyclop,funlen,gocognit // tag dispatch across all scene command types
 	if scene == nil {
 		return nil
 	}
@@ -68,9 +86,19 @@ func (r *GPUSceneRenderer) RenderScene(scene *Scene) error { //nolint:gocyclo,cy
 	// and restore the original state after rendering.
 	// Scene transforms use dc.SetTransform() (direct replacement) instead of
 	// dc.Push()/Pop() to avoid interfering with clip Push/Pop nesting.
-	baseMatrix := dc.GetTransform()
+	r.baseMatrix = dc.GetTransform()
+	r.firstErr = nil
+	baseMatrix := r.baseMatrix
 
 	for dec.Next() {
+		if ctx != nil {
+			select {
+			case <-ctx.Done():
+				dc.SetTransform(baseMatrix)
+				return ctx.Err()
+			default:
+			}
+		}
 		switch dec.Tag() {
 		case TagTransform:
 			a := dec.Transform()
@@ -123,7 +151,7 @@ func (r *GPUSceneRenderer) RenderScene(scene *Scene) error { //nolint:gocyclo,cy
 			} else {
 				dc.SetFillRule(gg.FillRuleNonZero)
 			}
-			_ = dc.FillPath(path)
+			r.recordErr(dc.FillPath(path))
 			path.Clear()
 
 		case TagFillRoundRect:
@@ -143,7 +171,7 @@ func (r *GPUSceneRenderer) RenderScene(scene *Scene) error { //nolint:gocyclo,cy
 				float64(rect.MaxX-rect.MinX), float64(rect.MaxY-rect.MinY),
 				radius,
 			)
-			_ = dc.Fill()
+			r.recordErr(dc.Fill())
 
 		case TagStroke:
 			brush, style := dec.Stroke()
@@ -158,7 +186,7 @@ func (r *GPUSceneRenderer) RenderScene(scene *Scene) error { //nolint:gocyclo,cy
 					dc.SetMiterLimit(float64(style.MiterLimit))
 				}
 			}
-			_ = dc.StrokePath(path)
+			r.recordErr(dc.StrokePath(path))
 			path.Clear()
 
 		case TagPushLayer:
@@ -216,7 +244,14 @@ func (r *GPUSceneRenderer) RenderScene(scene *Scene) error { //nolint:gocyclo,cy
 	// SetTransform is a direct replacement so we restore explicitly.
 	dc.SetTransform(baseMatrix)
 
-	return nil
+	return r.firstErr
+}
+
+// recordErr keeps the first draw error of the current RenderScene call.
+func (r *GPUSceneRenderer) recordErr(err error) {
+	if err != nil && r.firstErr == nil {
+		r.firstErr = err
+	}
 }
 
 // resolveText resolves a TagText glyph run. Prefers DrawShapedGlyphs (no re-shaping)

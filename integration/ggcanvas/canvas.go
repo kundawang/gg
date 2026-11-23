@@ -159,10 +159,11 @@ func NewWithScale(provider gpucontext.DeviceProvider, width, height int, scale f
 	)
 
 	// Share GPU device with accelerator if registered.
-	// Error is non-fatal: accelerator may not support device sharing or
-	// provider may not expose HAL types. GPU will initialize its own device.
+	// A missing accelerator is a normal no-op. A provider-set failure is
+	// non-fatal — the accelerator initializes its own device — but it is
+	// recorded by gg and logged here so the degradation is observable.
 	if err := gg.SetAcceleratorDeviceProvider(provider); err != nil {
-		gg.Logger().Warn("SetAcceleratorDeviceProvider failed", "err", err)
+		gg.Logger().Warn("SetAcceleratorDeviceProvider failed; accelerator will use its own device", "err", err)
 	}
 
 	var opts []gg.ContextOption

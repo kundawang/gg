@@ -61,6 +61,10 @@ func (m *mockAccelerator) SetLogger(l *slog.Logger) { m.logger = l }
 func resetAccelerator() {
 	accelMu.Lock()
 	accel = nil
+	retainedAccel = nil
+	retainedClosed = false
+	lastDeviceProvider = nil
+	accelStatus = AcceleratorStatus{State: AcceleratorUnregistered}
 	accelMu.Unlock()
 }
 

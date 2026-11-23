@@ -61,6 +61,7 @@ linters:
         - copylocks
       disable:
         - fieldalignment
+        - inline # too aggressive for reflect.Kind switch cases
 
     gocyclo:
       min-complexity: 20

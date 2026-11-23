@@ -4,8 +4,10 @@ import (
 	"errors"
 	"image"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/gogpu/gg/text"
 	"github.com/gogpu/gpucontext"
@@ -14,6 +16,146 @@ import (
 // ErrFallbackToCPU indicates the GPU accelerator cannot handle this operation.
 // The caller should transparently fall back to CPU rendering.
 var ErrFallbackToCPU = errors.New("gg: falling back to CPU rendering")
+
+// Sentinels describing accelerator lifecycle failures. All of them are
+// comparable with errors.Is, including through wrapping done by backends.
+var (
+	// ErrAcceleratorClosed is returned when an operation is attempted on an
+	// accelerator after Close. No GPU resource may be used after close.
+	ErrAcceleratorClosed = errors.New("gg: accelerator is closed")
+
+	// ErrDeviceLost is returned when the GPU device disappeared (driver reset,
+	// external provider shutdown, surface teardown). The accelerator is put in
+	// the device-lost state and is not used again until a successful
+	// [ReinitAccelerator] or [RegisterAccelerator].
+	ErrDeviceLost = errors.New("gg: GPU device lost")
+
+	// ErrNilDeviceProvider is returned when a nil DeviceProvider is passed to
+	// [SetAcceleratorDeviceProvider].
+	ErrNilDeviceProvider = errors.New("gg: device provider must not be nil")
+
+	// ErrNoAccelerator is returned by lifecycle operations that require a
+	// registered accelerator.
+	ErrNoAccelerator = errors.New("gg: no GPU accelerator registered")
+)
+
+// FallbackPolicy controls when a GPU error may be resolved by rendering the
+// operation on the CPU instead. Falling back is always an explicit policy
+// decision, never an implicit side effect.
+type FallbackPolicy uint32
+
+const (
+	// FallbackOnUnsupported only falls back when the accelerator reports
+	// [ErrFallbackToCPU] (the operation is not accelerated). Any other GPU
+	// error is returned to the caller. This is the strict mode.
+	FallbackOnUnsupported FallbackPolicy = iota
+
+	// FallbackOnError falls back on every GPU error, including device loss and
+	// backend failures. This is the default, and preserves the historical
+	// behavior of gg: a broken GPU never prevents rendering. The first error is
+	// still recorded in [AcceleratorStatus] and [GPUContextStatus]; it is not
+	// swallowed.
+	FallbackOnError
+)
+
+func (p FallbackPolicy) String() string {
+	switch p {
+	case FallbackOnUnsupported:
+		return "on-unsupported"
+	case FallbackOnError:
+		return "on-error"
+	default:
+		return "unknown"
+	}
+}
+
+// fallbackPolicyPtr holds the process-wide FallbackPolicy as an atomic uint32.
+// Default is FallbackOnError (zero value is FallbackOnUnsupported, so it is
+// initialized explicitly).
+var fallbackPolicyPtr atomic.Uint32
+
+func init() {
+	fallbackPolicyPtr.Store(uint32(FallbackOnError))
+}
+
+// SetGPUFallbackPolicy sets the process-wide policy used to decide whether a
+// failed GPU operation may be rendered on the CPU. It is safe for concurrent
+// use.
+func SetGPUFallbackPolicy(p FallbackPolicy) {
+	fallbackPolicyPtr.Store(uint32(p))
+}
+
+// GPUFallbackPolicy returns the current process-wide fallback policy.
+func GPUFallbackPolicy() FallbackPolicy {
+	return FallbackPolicy(fallbackPolicyPtr.Load())
+}
+
+// AllowCPUFallback reports whether err permits falling back to CPU under the
+// current [GPUFallbackPolicy]. A nil error never permits a fallback (the GPU
+// operation succeeded).
+func AllowCPUFallback(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrFallbackToCPU) {
+		// Unsupported operations are the one case the strict policy allows.
+		return true
+	}
+	return GPUFallbackPolicy() == FallbackOnError
+}
+
+// AcceleratorState describes where the registered accelerator is in its
+// lifecycle. It is informational: [Accelerator] returns nil for both the
+// device-lost and closed states.
+type AcceleratorState uint32
+
+const (
+	// AcceleratorUnregistered means no accelerator has been registered yet.
+	AcceleratorUnregistered AcceleratorState = iota
+
+	// AcceleratorReady means the accelerator is initialized and usable.
+	AcceleratorReady
+
+	// AcceleratorDeviceLost means the GPU device was lost. The accelerator is
+	// excluded from dispatch until a successful ReinitAccelerator or
+	// RegisterAccelerator call.
+	AcceleratorDeviceLost
+
+	// AcceleratorClosed means CloseAccelerator released the accelerator.
+	AcceleratorClosed
+)
+
+func (s AcceleratorState) String() string {
+	switch s {
+	case AcceleratorUnregistered:
+		return "unregistered"
+	case AcceleratorReady:
+		return "ready"
+	case AcceleratorDeviceLost:
+		return "device-lost"
+	case AcceleratorClosed:
+		return "closed"
+	default:
+		return "unknown"
+	}
+}
+
+// AcceleratorStatus is a snapshot of the accelerator lifecycle. Errors are
+// preserved so callers can detect a fallback without parsing log output.
+type AcceleratorStatus struct {
+	State         AcceleratorState
+	Name          string
+	Transitions   uint64 // lifecycle state changes observed
+	Registrations uint64 // successful RegisterAccelerator calls
+	InitFailures  uint64 // RegisterAccelerator calls whose Init failed
+	Closes        uint64 // accelerator Close invocations (replace or explicit)
+	DeviceLosses  uint64 // device-lost reports
+	ProviderSets  uint64 // successful SetAcceleratorDeviceProvider calls
+	Frames        uint64 // BeginAcceleratorFrame calls dispatched to an accelerator
+	Fallbacks     uint64 // GPU operations resolved on the CPU
+	FirstError    error  // first failure since the last successful registration
+	LastError     error  // most recent failure
+}
 
 // AcceleratedOp describes operation types for GPU capability checking.
 type AcceleratedOp uint32
@@ -258,14 +400,33 @@ type GPUShapedTextAccelerator interface {
 
 var (
 	accelMu sync.RWMutex
-	accel   GPUAccelerator
+
+	// accel is the usable accelerator. It is the only handle used for
+	// dispatch: nil means "GPU unavailable, render on CPU". A lost or closed
+	// accelerator is retained in retainedAccel so status and re-initialization
+	// remain possible without exposing dead resources to dispatch.
+	accel GPUAccelerator
+
+	// retainedAccel is the most recently registered accelerator, usable or not.
+	retainedAccel GPUAccelerator
+
+	// retainedClosed is true once Close has been invoked on retainedAccel.
+	retainedClosed bool
+
+	// accelStatus is the lifecycle counters snapshot. Guarded by accelMu.
+	accelStatus = AcceleratorStatus{State: AcceleratorUnregistered}
 )
 
 // RegisterAccelerator registers a GPU accelerator for optional GPU rendering.
 //
 // Only one accelerator can be registered. Subsequent calls replace the previous one.
 // The accelerator's Init() method is called during registration.
-// If Init() fails, the accelerator is not registered and the error is returned.
+// If Init() fails, the accelerator is not registered and the error is returned;
+// the previous accelerator (if any) stays registered and usable.
+//
+// A successful registration clears the device-lost state recorded by
+// [ReportAcceleratorDeviceLost], so recovery is: register the same or a new
+// accelerator.
 //
 // Typical usage via blank import in GPU backend packages:
 //
@@ -277,24 +438,47 @@ func RegisterAccelerator(a GPUAccelerator) error {
 		return errors.New("gg: accelerator must not be nil")
 	}
 	if err := a.Init(); err != nil {
+		accelMu.Lock()
+		accelStatus.InitFailures++
+		accelStatus.LastError = err
+		if accelStatus.FirstError == nil {
+			accelStatus.FirstError = err
+		}
+		accelMu.Unlock()
 		return err
 	}
 	accelMu.Lock()
-	old := accel
+	oldRetained := retainedAccel
+	oldClosed := retainedClosed
 	accel = a
+	retainedAccel = a
+	retainedClosed = false
+	accelStatus.State = AcceleratorReady
+	accelStatus.Name = a.Name()
+	accelStatus.Registrations++
+	accelStatus.Transitions++
+	accelStatus.FirstError = nil
+	accelStatus.LastError = nil
 	accelMu.Unlock()
 
 	// Propagate current logger to the new accelerator so it inherits
 	// any SetLogger configuration that was applied before registration.
 	propagateLogger(a, Logger())
 
-	if old != nil {
-		old.Close()
+	// Close the previous accelerator exactly once. A previous accelerator that
+	// had already lost its device is still retained, so it must be released
+	// here too; Close is never called twice on the same object.
+	if oldRetained != nil && oldRetained != a && !oldClosed {
+		recordAcceleratorClose()
+		oldRetained.Close()
 	}
 	return nil
 }
 
-// Accelerator returns the currently registered GPU accelerator, or nil if none.
+// Accelerator returns the currently registered GPU accelerator, or nil if none
+// is usable. A registered accelerator that reported device loss or has been
+// closed returns nil: callers fall back to CPU rather than touching dead
+// GPU resources. Use [AcceleratorStatus] to distinguish the states.
 func Accelerator() GPUAccelerator {
 	accelMu.RLock()
 	a := accel
@@ -308,7 +492,8 @@ func Accelerator() GPUAccelerator {
 //
 // Call this at application shutdown to prevent VkImage and other GPU memory
 // leaks. It is safe to call when no accelerator is registered (no-op).
-// CloseAccelerator is idempotent.
+// CloseAccelerator is idempotent: the underlying Close is invoked at most once
+// per registration, even under concurrent calls.
 //
 // Example:
 //
@@ -317,27 +502,214 @@ func CloseAccelerator() {
 	accelMu.Lock()
 	a := accel
 	accel = nil
+	if a == nil {
+		// No usable accelerator: close the retained one if that has not
+		// happened yet (e.g. it was lost before this call).
+		a = retainedAccel
+	}
+	if a == nil || retainedClosed {
+		accelMu.Unlock()
+		return
+	}
+	retainedClosed = true
+	accelStatus.State = AcceleratorClosed
+	accelStatus.Transitions++
 	accelMu.Unlock()
-	if a != nil {
-		a.Close()
+
+	recordAcceleratorClose()
+	a.Close()
+}
+
+// ReportAcceleratorDeviceLost marks the registered accelerator as unusable
+// after the GPU device was lost (driver reset, provider shutdown, surface
+// teardown). Subsequent [Accelerator] calls return nil, so rendering falls
+// back to the CPU, and no further GPU resource is used.
+//
+// The first report is recorded; repeated reports are counted but do not
+// change the state. Recovery requires a successful [RegisterAccelerator] or
+// [ReinitAccelerator].
+//
+// Backends call this themselves when they observe a lost device; it is also
+// exposed so hosts that own the device (gogpu) can notify gg.
+func ReportAcceleratorDeviceLost(err error) {
+	if err == nil {
+		err = ErrDeviceLost
+	}
+	accelMu.Lock()
+	defer accelMu.Unlock()
+	accelStatus.DeviceLosses++
+	recordAccelErrorLocked(err)
+	// Only a currently-usable accelerator can become lost. Reporting loss for
+	// an already-closed or already-lost accelerator is counted but must not
+	// rewrite the state (close is terminal until a new registration/reinit).
+	if accel == nil {
+		return
+	}
+	accel = nil
+	accelStatus.State = AcceleratorDeviceLost
+	accelStatus.Transitions++
+}
+
+// ReinitAccelerator re-initializes the registered accelerator after it lost
+// its device or was closed, returning it to the ready state on success.
+//
+// It calls Init() on the accelerator again (backends must re-acquire whatever
+// resources they released) and, when the accelerator implements
+// [DeviceProviderAware] and a provider was set previously, re-applies that
+// provider so shared-device setups recover without the host repeating the
+// wiring.
+//
+// It returns [ErrNoAccelerator] when nothing was ever registered. A previously
+// closed accelerator may be re-initialized: re-initialization is the
+// documented recovery path from [CloseAccelerator] as well as from device
+// loss, so both succeed when the backend can acquire its resources again.
+func ReinitAccelerator() error {
+	accelMu.Lock()
+	a := retainedAccel
+	provider := lastDeviceProvider
+	accelMu.Unlock()
+	if a == nil {
+		return ErrNoAccelerator
+	}
+	if err := a.Init(); err != nil {
+		accelMu.Lock()
+		recordAccelErrorLocked(err)
+		accelMu.Unlock()
+		return err
+	}
+	if provider != nil {
+		if dpa, ok := a.(DeviceProviderAware); ok {
+			if err := dpa.SetDeviceProvider(provider); err != nil {
+				accelMu.Lock()
+				recordAccelErrorLocked(err)
+				accelMu.Unlock()
+				return err
+			}
+		}
+	}
+	accelMu.Lock()
+	accel = a
+	retainedClosed = false
+	accelStatus.State = AcceleratorReady
+	accelStatus.Name = a.Name()
+	accelStatus.Transitions++
+	accelMu.Unlock()
+	return nil
+}
+
+// AcceleratorSnapshot returns a snapshot of the accelerator lifecycle. It is
+// safe for concurrent use.
+func AcceleratorSnapshot() AcceleratorStatus {
+	accelMu.RLock()
+	defer accelMu.RUnlock()
+	return accelStatus
+}
+
+// RecordGPUFallback notes that a GPU operation was resolved on the CPU. ctx and
+// op are informational; the error is folded into the lifecycle status so
+// callers can inspect the first and most recent reasons a fallback happened.
+func RecordGPUFallback(ctx, op string, err error) {
+	if err == nil {
+		err = ErrFallbackToCPU
+	}
+	accelMu.Lock()
+	accelStatus.Fallbacks++
+	recordAccelErrorLocked(err)
+	accelMu.Unlock()
+	if ctx != "" || op != "" {
+		Logger().Debug("GPU fallback to CPU", "context", ctx, "op", op, "err", err)
 	}
 }
+
+// recordAcceleratorClose bumps the close counter and transition count.
+func recordAcceleratorClose() {
+	accelMu.Lock()
+	accelStatus.Closes++
+	accelStatus.Transitions++
+	accelMu.Unlock()
+}
+
+// recordAccelErrorLocked records err as the latest lifecycle error and keeps
+// the first one. Callers must hold accelMu.
+func recordAccelErrorLocked(err error) {
+	if err == nil {
+		return
+	}
+	accelStatus.LastError = err
+	if accelStatus.FirstError == nil {
+		accelStatus.FirstError = err
+	}
+}
+
+// ClassifyAcceleratorError reports which lifecycle failure err represents, if
+// any. Backends are expected to wrap their concrete error with the matching
+// sentinel (errors.Is-compatible) so callers get a stable classification.
+// A plain error is classified as a generic backend failure.
+func ClassifyAcceleratorError(err error) AcceleratorState {
+	switch {
+	case err == nil:
+		return AcceleratorReady
+	case errors.Is(err, ErrAcceleratorClosed):
+		return AcceleratorClosed
+	case errors.Is(err, ErrDeviceLost):
+		return AcceleratorDeviceLost
+	default:
+		return AcceleratorUnregistered
+	}
+}
+
+// lastDeviceProvider remembers the most recently applied provider so
+// ReinitAccelerator can restore shared-device wiring. Guarded by accelMu.
+var lastDeviceProvider gpucontext.DeviceProvider
 
 // SetAcceleratorDeviceProvider passes a device provider to the registered
 // accelerator, enabling GPU device sharing. If no accelerator is registered
 // or it doesn't support device sharing, this is a no-op.
 //
+// Passing a nil provider returns [ErrNilDeviceProvider] before touching the
+// accelerator, so a misconfigured host cannot crash the backend.
+//
 // The provider's Device() returns gpucontext.Device; accelerators type-assert
 // to *wgpu.Device to obtain HAL access for GPU operations.
 func SetAcceleratorDeviceProvider(provider gpucontext.DeviceProvider) error {
+	if isNilDeviceProvider(provider) {
+		return ErrNilDeviceProvider
+	}
 	a := Accelerator()
 	if a == nil {
 		return nil
 	}
-	if dpa, ok := a.(DeviceProviderAware); ok {
-		return dpa.SetDeviceProvider(provider)
+	dpa, ok := a.(DeviceProviderAware)
+	if !ok {
+		return nil
 	}
+	if err := dpa.SetDeviceProvider(provider); err != nil {
+		accelMu.Lock()
+		recordAccelErrorLocked(err)
+		accelMu.Unlock()
+		return err
+	}
+	accelMu.Lock()
+	lastDeviceProvider = provider
+	accelStatus.ProviderSets++
+	accelMu.Unlock()
 	return nil
+}
+
+// isNilDeviceProvider reports whether provider is nil, including a typed nil
+// pointer stored in the interface (whose methods would dereference nil).
+func isNilDeviceProvider(provider gpucontext.DeviceProvider) bool {
+	if provider == nil {
+		return true
+	}
+	v := reflect.ValueOf(provider)
+	//nolint:exhaustive // only nil-capable kinds can carry a typed-nil provider
+	switch v.Kind() {
+	case reflect.Ptr, reflect.Map, reflect.Func, reflect.Chan, reflect.Slice, reflect.Interface:
+		return v.IsNil()
+	default:
+		return false
+	}
 }
 
 // AcceleratorCanRenderDirect returns true if the registered GPU accelerator
@@ -425,16 +797,21 @@ func renderMode() renderModeType {
 // surface. Must be called once per frame before any drawing operations
 // when using direct surface rendering (RenderDirect).
 //
-// If no accelerator is registered or it doesn't implement FrameAware,
-// this is a no-op.
+// If no accelerator is registered (or the registered one is not usable) or it
+// doesn't implement FrameAware, this is a no-op.
 func BeginAcceleratorFrame() {
 	a := Accelerator()
 	if a == nil {
 		return
 	}
-	if fa, ok := a.(FrameAware); ok {
-		fa.BeginFrame()
+	fa, ok := a.(FrameAware)
+	if !ok {
+		return
 	}
+	fa.BeginFrame()
+	accelMu.Lock()
+	accelStatus.Frames++
+	accelMu.Unlock()
 }
 
 // ComputePipelineAware is an optional interface for accelerators that support

@@ -1,6 +1,7 @@
 package gg
 
 import (
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -8,6 +9,8 @@ import (
 	"image/png"
 	"io"
 	"math"
+	"sync"
+	"sync/atomic"
 
 	"github.com/gogpu/gg/internal/clip"
 	"github.com/gogpu/gg/text"
@@ -79,7 +82,8 @@ type Context struct {
 	// Typed as gpuContextOps (defined in this package) to avoid circular import
 	// with internal/gpu while maintaining type safety.
 	gpuCtx            gpuContextOps
-	gpuFallbackWarned bool // true after first global fallback warning (avoid log spam)
+	gpuCtxOwner       GPUAccelerator // accelerator that created gpuCtx
+	gpuFallbackWarned bool           // true after first global fallback warning (avoid log spam)
 
 	// Per-frame compositor (ADR-067). Set by ggcanvas.renderDirectToTarget,
 	// included in GPURenderTarget.Compositor for each render call.
@@ -87,7 +91,85 @@ type Context struct {
 	frameCompositor gpucontext.SurfaceCompositor
 
 	// Lifecycle
-	closed bool // Indicates whether Close has been called
+	closeOnce sync.Once
+	closed    atomic.Bool // Indicates whether Close has been called
+
+	// gpuMu guards lazy creation and invalidation of gpuCtx.
+	gpuMu sync.RWMutex
+
+	// GPU error attribution (lifecycle quality). The first GPU error and the
+	// decision taken for it (fallback vs. propagate) are recorded here so that
+	// callers can tell whether a Context silently fell back to CPU.
+	gpuErrMu     sync.Mutex
+	gpuFirstErr  error
+	gpuLastErr   error
+	gpuFallbacks uint64
+}
+
+// ContextGPUStatus is a snapshot of how the Context interacted with the GPU
+// accelerator. It lets callers verify that an operation fell back to CPU and
+// why, instead of inferring it from log output.
+type ContextGPUStatus struct {
+	Closed    bool   // the Context has been closed
+	Fallbacks uint64 // GPU operations resolved on the CPU
+	FirstErr  error  // first GPU error observed by this Context
+	LastErr   error  // most recent GPU error observed by this Context
+}
+
+// GPUStatus returns a snapshot of the Context's GPU error/fallback state.
+// It is safe to call concurrently with rendering.
+func (c *Context) GPUStatus() ContextGPUStatus {
+	c.gpuErrMu.Lock()
+	defer c.gpuErrMu.Unlock()
+	return ContextGPUStatus{
+		Closed:    c.isClosed(),
+		Fallbacks: c.gpuFallbacks,
+		FirstErr:  c.gpuFirstErr,
+		LastErr:   c.gpuLastErr,
+	}
+}
+
+// isClosed reports whether Close has completed.
+func (c *Context) isClosed() bool {
+	return c.closed.Load()
+}
+
+// noteGPUError records a GPU error on the Context and marks the global
+// accelerator as lost when err signals device loss. The first error is kept so
+// a later successful fallback cannot hide the original failure.
+func (c *Context) noteGPUError(op string, err error) {
+	if err == nil {
+		return
+	}
+	if ClassifyAcceleratorError(err) == AcceleratorDeviceLost {
+		ReportAcceleratorDeviceLost(err)
+	}
+	c.gpuErrMu.Lock()
+	c.gpuLastErr = err
+	if c.gpuFirstErr == nil {
+		c.gpuFirstErr = err
+	}
+	c.gpuErrMu.Unlock()
+	Logger().Debug("GPU operation failed", "op", op, "err", err)
+}
+
+// resolveGPUError applies the global [FallbackPolicy] to a GPU failure.
+// It returns (true, nil) when the operation may be retried on the CPU, and
+// (false, err) when the error must be propagated to the caller. The first error
+// is always recorded; a permitted fallback is recorded as such, never dropped.
+func (c *Context) resolveGPUError(op string, err error) (bool, error) {
+	if err == nil {
+		return false, nil
+	}
+	c.noteGPUError(op, err)
+	if !AllowCPUFallback(err) {
+		return false, err
+	}
+	c.gpuErrMu.Lock()
+	c.gpuFallbacks++
+	c.gpuErrMu.Unlock()
+	RecordGPUFallback("context", op, err)
+	return true, nil
 }
 
 type contextClipState struct {
@@ -255,24 +337,37 @@ func NewContextWithScale(width, height int, scale float64) *Context {
 // Note: Close does NOT shut down the global GPU accelerator itself,
 // since it may be shared by other contexts. To release GPU resources
 // at application shutdown, call [CloseAccelerator].
+//
+// Close is safe for concurrent use: the flush and per-context GPU release run
+// exactly once, and later calls (from any goroutine) return nil.
 func (c *Context) Close() error {
-	if c.closed {
+	first := false
+	c.closeOnce.Do(func() {
+		first = true
+		// Flush pending GPU operations so queued shapes are not lost *before*
+		// marking the Context closed: the flush goes through the same lifetime
+		// checks as any draw, and a flush failure is recorded against a live
+		// Context. A closed flag set first would also make the flush observe
+		// itself as "already closed" and skip delivery.
+		c.flushGPUAcceleratorOnClose()
+		c.closed.Store(true)
+	})
+	if !first {
 		return nil
 	}
-	c.closed = true
-
-	// Flush pending GPU operations so queued shapes are not lost.
-	c.flushGPUAccelerator()
 
 	// Close per-context GPU render context if it was created.
-	if c.gpuCtx != nil {
+	c.gpuMu.Lock()
+	rc := c.gpuCtx
+	c.gpuCtx = nil
+	c.gpuMu.Unlock()
+	if rc != nil {
 		type gpuCtxCloser interface {
 			Close()
 		}
-		if closer, ok := c.gpuCtx.(gpuCtxCloser); ok {
+		if closer, ok := rc.(gpuCtxCloser); ok {
 			closer.Close()
 		}
-		c.gpuCtx = nil
 	}
 
 	// Clear path to release memory
@@ -587,7 +682,9 @@ func (c *Context) trackDamage(bounds image.Rectangle) {
 //
 // See ADR-016, TASK-GG-COMPOSITOR-003.
 func (c *Context) FillRectCPU(x, y, w, h float64, col RGBA) {
-	c.flushGPUAccelerator()
+	// FillRectCPU cannot return an error (it is a hot-path helper). A failed
+	// flush is recorded by gpuFailure and the CPU fill still runs.
+	_ = c.flushGPUAccelerator()
 
 	ctm := c.totalMatrix()
 	tl := ctm.TransformPoint(Pt(x, y))
@@ -1407,15 +1504,34 @@ func (c *Context) BeginGPUFrame() {
 }
 
 func (c *Context) FlushGPU() error {
+	if c.isClosed() {
+		return nil
+	}
 	t := c.gpuRenderTarget()
 	if rc := c.gpuCtxOps(); rc != nil {
-		return rc.Flush(t)
+		return c.resolveFlushError("FlushGPU", rc.Flush(t))
 	}
 	if a := Accelerator(); a != nil {
 		c.warnGPUFallback("FlushGPU")
-		return a.Flush(t)
+		return c.resolveFlushError("FlushGPU", a.Flush(t))
 	}
 	return nil
+}
+
+// resolveFlushError records a Flush error and returns it unchanged.
+//
+// Flush is the final step of GPU work, not an operation that can be rerendered:
+// a failed flush already consumed (and cleared) its pending commands, so there
+// is nothing to "fall back" for. Returning the original error lets callers
+// (e.g. ggcanvas) decide whether to log it or surface it, while the Context and
+// accelerator status retain it for observability. Repeated FlushGPU calls do
+// not re-submit the failed commands.
+func (c *Context) resolveFlushError(op string, err error) error {
+	if err == nil {
+		return nil
+	}
+	c.noteGPUError(op, err)
+	return err
 }
 
 // FlushGPUWithView flushes pending GPU operations, resolving directly to the
@@ -1462,6 +1578,9 @@ func (c *Context) SetPerFrameCompositor(comp gpucontext.SurfaceCompositor) {
 }
 
 func (c *Context) flushGPUWithView(view gpucontext.TextureView, width, height uint32, preserveContent bool) error {
+	if c.isClosed() {
+		return ErrFallbackToCPU
+	}
 	t := c.gpuRenderTarget()
 	if !view.IsNil() {
 		t.View = view
@@ -1507,6 +1626,9 @@ func (c *Context) flushGPUWithView(view gpucontext.TextureView, width, height ui
 // This enables sub-region compositing: a 48×48 spinner updates only 9KB
 // instead of the full surface (8MB at 1080p). See ADR-016 Phase 2.
 func (c *Context) FlushGPUWithViewDamage(view gpucontext.TextureView, width, height uint32, damageRect image.Rectangle) error {
+	if c.isClosed() {
+		return ErrFallbackToCPU
+	}
 	t := c.gpuRenderTarget()
 	if !view.IsNil() {
 		t.View = view
@@ -1530,6 +1652,9 @@ func (c *Context) FlushGPUWithViewDamage(view gpucontext.TextureView, width, hei
 // (ADR-028). Each overlay gets its own scissor from the closest damage rect,
 // enabling per-draw dynamic scissor for distant dirty regions.
 func (c *Context) FlushGPUWithViewDamageRects(view gpucontext.TextureView, width, height uint32, rects []image.Rectangle) error {
+	if c.isClosed() {
+		return ErrFallbackToCPU
+	}
 	t := c.gpuRenderTarget()
 	if !view.IsNil() {
 		t.View = view
@@ -1593,38 +1718,79 @@ type gpuContextAliasedTextOps interface {
 // per-context rendering. The returned value should be type-asserted to
 // *gpu.GPURenderContext in internal/gpu consumers.
 func (c *Context) GPURenderContext() any {
-	c.ensureGPUCtx()
-	return c.gpuCtx
+	return c.ensureGPUCtx()
 }
 
 // ensureGPUCtx lazily creates the per-context GPU render context.
-func (c *Context) ensureGPUCtx() {
-	if c.gpuCtx != nil {
-		return
+//
+// The context is owned by the accelerator that created it. If the global
+// accelerator was replaced (RegisterAccelerator) or became unusable (device
+// loss, CloseAccelerator), the stale per-context context is closed and a new
+// one is created from the current accelerator. This prevents queueing draw
+// commands into a render context whose device has already been released.
+func (c *Context) ensureGPUCtx() gpuContextOps {
+	if c.isClosed() {
+		return nil
+	}
+	c.gpuMu.Lock()
+	defer c.gpuMu.Unlock()
+	if c.isClosed() {
+		return nil
 	}
 	a := Accelerator()
+	if c.gpuCtx != nil && c.gpuCtxOwner == a {
+		return c.gpuCtx
+	}
+	if c.gpuCtx != nil {
+		c.closeGPUCtxLocked()
+	}
 	if a == nil {
-		return
+		return nil
 	}
 	p, ok := a.(GPURenderContextProvider)
 	if !ok {
-		return
+		return nil
 	}
 	rc := p.NewGPURenderContext()
 	if rc == nil {
-		return
+		return nil
 	}
 	ops, ok := rc.(gpuContextOps)
 	if !ok {
-		return
+		return nil
 	}
 	c.gpuCtx = ops
+	c.gpuCtxOwner = a
+	return ops
+}
+
+// closeGPUCtxLocked releases the per-context GPU context. Caller holds gpuMu.
+func (c *Context) closeGPUCtxLocked() {
+	if c.gpuCtx == nil {
+		return
+	}
+	if closer, ok := c.gpuCtx.(interface{ Close() }); ok {
+		closer.Close()
+	}
+	c.gpuCtx = nil
+	c.gpuCtxOwner = nil
 }
 
 // gpuCtxOps returns the per-context GPU ops interface, or nil if unavailable.
+// It returns nil for a closed Context and for a Context whose accelerator is no
+// longer usable, so no operation touches released GPU resources.
 func (c *Context) gpuCtxOps() gpuContextOps {
-	c.ensureGPUCtx()
-	return c.gpuCtx
+	if c.isClosed() {
+		return nil
+	}
+	c.gpuMu.RLock()
+	rc := c.gpuCtx
+	owner := c.gpuCtxOwner
+	c.gpuMu.RUnlock()
+	if rc != nil && owner != nil && owner == Accelerator() {
+		return rc
+	}
+	return c.ensureGPUCtx()
 }
 
 // gpuRenderTarget returns the current context's pixel buffer as a GPU render target.
@@ -1649,56 +1815,114 @@ func (c *Context) warnGPUFallback(op string) {
 	}
 }
 
-// flushGPUAccelerator flushes pending GPU shapes before a CPU fallback operation.
-func (c *Context) flushGPUAccelerator() {
-	if rc := c.gpuCtxOps(); rc != nil {
-		_ = rc.Flush(c.gpuRenderTarget())
+// flushGPUAcceleratorOnClose flushes pending GPU work during Close. It runs
+// before the Context is marked closed, so it uses the same lifetime checks as a
+// normal draw. A failed flush is recorded but not returned: Close has no
+// meaningful recovery and must stay idempotent.
+func (c *Context) flushGPUAcceleratorOnClose() {
+	if c.isClosed() {
+		return
+	}
+	// Only flush a GPU context that already exists. Close must not create a new
+	// per-context GPU context (and its resources) just to flush nothing.
+	if rc := c.peekGPUCtxOps(); rc != nil {
+		if err := rc.Flush(c.gpuRenderTarget()); err != nil {
+			c.noteGPUError("close-flush", err)
+		}
 		return
 	}
 	if a := Accelerator(); a != nil {
-		c.warnGPUFallback("flushGPUAccelerator")
-		_ = a.Flush(c.gpuRenderTarget())
+		if err := a.Flush(c.gpuRenderTarget()); err != nil {
+			c.noteGPUError("close-flush-global", err)
+		}
 	}
+}
+
+// peekGPUCtxOps returns the existing per-context GPU ops, or nil. Unlike
+// gpuCtxOps it never creates a context, so it is safe to call on paths that
+// must not allocate GPU resources (Close).
+func (c *Context) peekGPUCtxOps() gpuContextOps {
+	c.gpuMu.RLock()
+	rc := c.gpuCtx
+	owner := c.gpuCtxOwner
+	c.gpuMu.RUnlock()
+	if rc == nil || owner != Accelerator() {
+		return nil
+	}
+	return rc
+}
+
+// flushGPUAccelerator flushes pending GPU shapes before a CPU fallback
+// operation. It returns nil when the flush succeeded, was unnecessary, or when
+// no GPU is available. A GPU failure is recorded and, when the active
+// [FallbackPolicy] permits it, converted to [ErrFallbackToCPU] so the caller can
+// render the operation on the CPU; otherwise the failure is returned.
+//
+// The flush never retries and never re-submits its commands.
+func (c *Context) flushGPUAccelerator() error {
+	if c.isClosed() {
+		return nil
+	}
+	if rc := c.gpuCtxOps(); rc != nil {
+		return c.gpuFailure("flush", rc.Flush(c.gpuRenderTarget()))
+	}
+	if a := Accelerator(); a != nil {
+		c.warnGPUFallback("flushGPUAccelerator")
+		return c.gpuFailure("flush-global", a.Flush(c.gpuRenderTarget()))
+	}
+	return nil
 }
 
 // tryGPUFill attempts to fill the current path using the GPU accelerator.
 // When a mask is active and the accelerator implements MaskAware, the mask
 // is uploaded as a GPU texture. Otherwise, falls back to CPU.
+//
+// Return contract: nil means the fill was handled on the GPU;
+// [ErrFallbackToCPU] means the CPU may render it; any other error is a GPU
+// failure that the active policy did not permit resolving on the CPU.
 func (c *Context) tryGPUFill() error {
+	if c.isClosed() {
+		return ErrFallbackToCPU
+	}
 	cleanup, err := c.setupGPUMask()
 	if err != nil {
 		return err
 	}
 	defer cleanup()
 	if rc := c.gpuCtxOps(); rc != nil {
-		return c.tryGPUOpRC(rc.FillShape, rc.FillPath)
+		return c.tryGPUOpRC("fill", rc.FillShape, rc.FillPath)
 	}
 	a := Accelerator()
 	if a == nil {
 		return ErrFallbackToCPU
 	}
 	c.warnGPUFallback("tryGPUFill")
-	return c.tryGPUOp(a, a.FillShape, a.FillPath, AccelFill)
+	return c.tryGPUOp("fill", a, a.FillShape, a.FillPath, AccelFill)
 }
 
 // tryGPUStroke attempts to stroke the current path using the GPU accelerator.
 // When a mask is active and the accelerator implements MaskAware, the mask
 // is uploaded as a GPU texture. Otherwise, falls back to CPU.
+//
+// Return contract matches [Context.tryGPUFill].
 func (c *Context) tryGPUStroke() error {
+	if c.isClosed() {
+		return ErrFallbackToCPU
+	}
 	cleanup, err := c.setupGPUMask()
 	if err != nil {
 		return err
 	}
 	defer cleanup()
 	if rc := c.gpuCtxOps(); rc != nil {
-		return c.tryGPUOpRC(rc.StrokeShape, rc.StrokePath)
+		return c.tryGPUOpRC("stroke", rc.StrokeShape, rc.StrokePath)
 	}
 	a := Accelerator()
 	if a == nil {
 		return ErrFallbackToCPU
 	}
 	c.warnGPUFallback("tryGPUStroke")
-	return c.tryGPUOp(a, a.StrokeShape, a.StrokePath, AccelStroke)
+	return c.tryGPUOp("stroke", a, a.StrokeShape, a.StrokePath, AccelStroke)
 }
 
 // setupGPUMask uploads the active alpha mask to the GPU accelerator.
@@ -1720,7 +1944,13 @@ func (c *Context) setupGPUMask() (func(), error) {
 }
 
 // tryGPUOpRC routes GPU operations through the per-context GPURenderContext.
+//
+// The shape tier is tried first and, only when it declines with
+// ErrFallbackToCPU (it queued nothing), the path tier runs. A hard GPU error
+// stops the attempt immediately: it is never re-submitted through the path
+// tier, and it is surfaced or converted to a CPU fallback by the policy.
 func (c *Context) tryGPUOpRC(
+	op string,
 	shapeFn func(GPURenderTarget, DetectedShape, *Paint) error,
 	pathFn func(GPURenderTarget, *Path, *Paint) error,
 ) error {
@@ -1730,10 +1960,15 @@ func (c *Context) tryGPUOpRC(
 	if accel := sdfAccelForShape(shape.Kind); accel != 0 {
 		if err := shapeFn(target, shape, c.paint); err == nil {
 			return nil
+		} else if !errors.Is(err, ErrFallbackToCPU) {
+			return c.gpuFailure(op+"-shape", err)
 		}
 	}
 
-	return pathFn(target, c.path, c.paint)
+	if err := pathFn(target, c.path, c.paint); err != nil {
+		return c.gpuFailure(op+"-path", err)
+	}
+	return nil
 }
 
 // tryGPUOp attempts GPU rendering using shape-specific SDF first, then general path.
@@ -1745,7 +1980,11 @@ func (c *Context) tryGPUOpRC(
 //
 // When PipelineModeRenderPass is active (or Auto selects RenderPass), the
 // existing tier-based approach is used: shape SDF first, then general path.
+//
+// Error handling matches [Context.tryGPUOpRC]: a hard error is not retried
+// through the next tier.
 func (c *Context) tryGPUOp(
+	op string,
 	a GPUAccelerator,
 	shapeFn func(GPURenderTarget, DetectedShape, *Paint) error,
 	pathFn func(GPURenderTarget, *Path, *Paint) error,
@@ -1759,7 +1998,7 @@ func (c *Context) tryGPUOp(
 	if c.pipelineMode == PipelineModeCompute {
 		if cpa, ok := a.(ComputePipelineAware); ok && cpa.CanCompute() {
 			if a.CanAccelerate(pathAccel) {
-				return pathFn(target, c.path, c.paint)
+				return c.gpuFailure(op+"-compute", pathFn(target, c.path, c.paint))
 			}
 		}
 		// Compute requested but not available — fall through to render pass.
@@ -1770,15 +2009,37 @@ func (c *Context) tryGPUOp(
 	if accel := sdfAccelForShape(shape.Kind); accel != 0 && a.CanAccelerate(accel) {
 		if err := shapeFn(target, shape, c.paint); err == nil {
 			return nil
+		} else if !errors.Is(err, ErrFallbackToCPU) {
+			return c.gpuFailure(op+"-shape", err)
 		}
 	}
 
 	// Try general GPU path operation.
 	if a.CanAccelerate(pathAccel) {
-		return pathFn(target, c.path, c.paint)
+		return c.gpuFailure(op+"-path", pathFn(target, c.path, c.paint))
 	}
 
 	return ErrFallbackToCPU
+}
+
+// gpuFailure classifies err from a GPU tier. ErrFallbackToCPU is propagated
+// unchanged (the tier declined and queued nothing). Any other error is recorded
+// and either returned (strict policy) or converted to ErrFallbackToCPU
+// (permissive policy), with the original error retained in the fallback log and
+// Context status.
+func (c *Context) gpuFailure(op string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, ErrFallbackToCPU) {
+		return ErrFallbackToCPU
+	}
+	if ok, perr := c.resolveGPUError(op, err); ok {
+		return ErrFallbackToCPU
+	} else if perr != nil {
+		return perr
+	}
+	return err
 }
 
 // sdfAccelForShape maps a shape kind to its SDF acceleration capability.
@@ -1829,14 +2090,25 @@ func (c *Context) doFill() error {
 	// (which reads c.path for shape detection and path rendering).
 	origPath := c.path
 	c.path = devicePath
-	ok, cpuMode := c.tryGPUFillWithMode(mode)
+	ok, cpuMode, gpuErr := c.tryGPUFillWithMode(mode)
 	c.path = origPath
+	if gpuErr != nil {
+		// Strict policy: the GPU failure is surfaced. Nothing was queued, so
+		// the caller can retry with a different accelerator or policy.
+		return gpuErr
+	}
 	if ok {
 		return nil
 	}
 
-	// CPU path: flush pending GPU, apply mode and AA state to software renderer.
-	c.flushGPUAccelerator()
+	// CPU path: flush pending GPU before switching rasterizers. Under the
+	// permissive policy a failed flush has already been recorded and converted
+	// to ErrFallbackToCPU; the CPU draw still runs (the failed flush consumed
+	// its commands, so nothing is left half-rendered). A strict-policy hard
+	// error is returned and the draw does not proceed.
+	if err := c.flushGPUAccelerator(); err != nil && !errors.Is(err, ErrFallbackToCPU) {
+		return err
+	}
 	if sr, ok := c.renderer.(*SoftwareRenderer); ok {
 		sr.rasterizerMode = cpuMode
 		sr.antiAlias = c.antiAlias
@@ -1883,12 +2155,17 @@ func (c *Context) doStroke() error {
 	// Temporarily swap c.path to device-space for GPU tryGPUOp.
 	origPath := c.path
 	c.path = devicePath
-	ok, cpuMode := c.tryGPUStrokeWithMode(mode)
+	ok, cpuMode, gpuErr := c.tryGPUStrokeWithMode(mode)
 	c.path = origPath
+	if gpuErr != nil {
+		return gpuErr
+	}
 	if ok {
 		return nil
 	}
-	c.flushGPUAccelerator()
+	if err := c.flushGPUAccelerator(); err != nil && !errors.Is(err, ErrFallbackToCPU) {
+		return err
+	}
 	if sr, ok := c.renderer.(*SoftwareRenderer); ok {
 		sr.rasterizerMode = cpuMode
 		sr.antiAlias = c.antiAlias
@@ -2102,45 +2379,58 @@ func (c *Context) setGPUClipPath() func() {
 }
 
 // tryGPUFillWithMode attempts GPU fill based on the rasterizer mode.
-// Returns (true, _) if GPU handled the fill, or (false, cpuMode) with the
-// fallback CPU mode to use.
-func (c *Context) tryGPUFillWithMode(mode RasterizerMode) (bool, RasterizerMode) {
+//
+// It returns (handled, cpuMode, err). err is non-nil only when a GPU failure
+// must be propagated under the strict [FallbackOnUnsupported] policy; a
+// permitted fallback returns (false, cpuMode, nil). When RasterizerSDF was
+// requested and the GPU declined, the returned cpuMode is RasterizerAuto so
+// the CPU renderer can still render the shape.
+func (c *Context) tryGPUFillWithMode(mode RasterizerMode) (bool, RasterizerMode, error) {
 	if mode == RasterizerSDF {
 		c.setForceSDF(true)
 		err := c.tryGPUFill()
 		c.setForceSDF(false)
 		if err == nil {
-			return true, mode
+			return true, mode, nil
+		}
+		if !errors.Is(err, ErrFallbackToCPU) {
+			return false, mode, err
 		}
 		mode = RasterizerAuto // Non-SDF shape → auto CPU fallback.
 	}
 	if mode == RasterizerAuto {
 		if err := c.tryGPUFill(); err == nil {
-			return true, mode
+			return true, mode, nil
+		} else if !errors.Is(err, ErrFallbackToCPU) {
+			return false, mode, err
 		}
 	}
-	return false, mode
+	return false, mode, nil
 }
 
 // tryGPUStrokeWithMode attempts GPU stroke based on the rasterizer mode.
-// Returns (true, _) if GPU handled the stroke, or (false, cpuMode) with the
-// fallback CPU mode to use.
-func (c *Context) tryGPUStrokeWithMode(mode RasterizerMode) (bool, RasterizerMode) {
+// Return contract matches [Context.tryGPUFillWithMode].
+func (c *Context) tryGPUStrokeWithMode(mode RasterizerMode) (bool, RasterizerMode, error) {
 	if mode == RasterizerSDF {
 		c.setForceSDF(true)
 		err := c.tryGPUStroke()
 		c.setForceSDF(false)
 		if err == nil {
-			return true, mode
+			return true, mode, nil
+		}
+		if !errors.Is(err, ErrFallbackToCPU) {
+			return false, mode, err
 		}
 		mode = RasterizerAuto
 	}
 	if mode == RasterizerAuto {
 		if err := c.tryGPUStroke(); err == nil {
-			return true, mode
+			return true, mode, nil
+		} else if !errors.Is(err, ErrFallbackToCPU) {
+			return false, mode, err
 		}
 	}
-	return false, mode
+	return false, mode, nil
 }
 
 // setForceSDF enables/disables forced SDF on the registered accelerator.
