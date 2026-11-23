@@ -806,20 +806,14 @@ func (c *Context) textOutlinePath(s string, x, y float64) *Path {
 
 	// Use glyph cache to avoid repeated outline extraction.
 	cache := c.ensureGlyphCache()
-	fontID := computeTextFontID(source)
-	var sizeKey int16
-	switch {
-	case fontSize < 0:
-		sizeKey = 0
-	case fontSize > 32767:
-		sizeKey = 32767
-	default:
-		sizeKey = int16(fontSize) //nolint:gosec // bounds checked above
-	}
 
 	// ADR-054: pass variations for variable font gvar deltas (enterprise invariant).
 	variations := c.face.Variations()
 	varHash := text.VariationHash(variations)
+	// Font hot-reload: include the source generation so a reloaded font with
+	// the same FontID cannot resolve outlines cached for the closed source.
+	generation := source.Generation()
+	fontID := computeTextFontID(source)
 
 	path := NewPath()
 	hasContour := false
@@ -827,11 +821,12 @@ func (c *Context) textOutlinePath(s string, x, y float64) *Path {
 	shaped := text.Shape(s, c.face)
 	for _, sg := range shaped {
 		cacheKey := text.OutlineCacheKey{
-			FontID:        fontID,
-			GID:           sg.GID,
-			Size:          sizeKey,
-			Hinting:       text.HintingNone,
-			VariationHash: varHash,
+			FontID:           fontID,
+			SourceGeneration: generation,
+			GID:              sg.GID,
+			Size:             text.SizeToCacheKey(fontSize),
+			Hinting:          text.HintingNone,
+			VariationHash:    varHash,
 		}
 		outline := cache.GetOrCreate(cacheKey, func() *text.GlyphOutline {
 			o, err := extractor.ExtractOutlineHintedVar(parsed, sg.GID, fontSize, text.HintingNone, variations)

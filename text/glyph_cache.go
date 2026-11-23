@@ -2,11 +2,27 @@ package text
 
 import (
 	"encoding/binary"
+	"fmt"
 	"hash/fnv"
 	"math"
 	"sync"
 	"sync/atomic"
 )
+
+// GlyphCacheObserver receives cache lifecycle events. It is intended for
+// diagnostics and tests that need to prove a hot-reloaded font does not reuse
+// outlines from the previous source generation.
+//
+// Observer callbacks are invoked synchronously, without any cache lock held,
+// and may run concurrently from multiple goroutines. Implementations must be
+// safe for concurrent use. A slow observer throttles cache access.
+type GlyphCacheObserver interface {
+	// OnOutlineAccess reports a lookup. hit is true when key resolved.
+	OnOutlineAccess(key OutlineCacheKey, hit bool)
+
+	// OnOutlineInsert reports that a new outline was stored under key.
+	OnOutlineInsert(key OutlineCacheKey)
+}
 
 // GlyphCacheConfig holds configuration for GlyphCache.
 type GlyphCacheConfig struct {
@@ -18,6 +34,10 @@ type GlyphCacheConfig struct {
 	// before being eligible for eviction during Maintain().
 	// Default: 64
 	FrameLifetime int
+
+	// Observer, when non-nil, receives hit/miss and insertion events.
+	// Default: nil
+	Observer GlyphCacheObserver
 }
 
 // DefaultGlyphCacheConfig returns the default cache configuration.
@@ -31,7 +51,22 @@ func DefaultGlyphCacheConfig() GlyphCacheConfig {
 // OutlineCacheKey uniquely identifies a cached glyph outline.
 type OutlineCacheKey struct {
 	// FontID is a unique identifier for the font.
+	//
+	// FontID is derived from stable font metadata (full name and glyph count),
+	// so two independently loaded versions of the same font file intentionally
+	// share a FontID. It must therefore never be the only cache discriminator
+	// for a font that can be hot-reloaded.
 	FontID uint64
+
+	// SourceGeneration identifies the FontSource instance that produced the
+	// outline. Every FontSource created by NewFontSource receives a
+	// process-unique generation, so reloading a font from the same path yields
+	// a new generation even when FontID is unchanged. This prevents a fresh
+	// source from observing outlines cached for a closed predecessor.
+	//
+	// Zero is reserved for keys that are not associated with a FontSource
+	// (for example legacy callers that only have a ParsedFont).
+	SourceGeneration uint64
 
 	// GID is the glyph index within the font.
 	GID GlyphID
@@ -96,6 +131,9 @@ type GlyphCache struct {
 	// config holds cache configuration
 	config GlyphCacheConfig
 
+	// observer receives lifecycle events (may be nil)
+	observer GlyphCacheObserver
+
 	// currentFrame is the current frame counter for frame-based eviction
 	currentFrame atomic.Uint64
 
@@ -149,7 +187,8 @@ func NewGlyphCacheWithConfig(config GlyphCacheConfig) *GlyphCache {
 	}
 
 	c := &GlyphCache{
-		config: config,
+		config:   config,
+		observer: config.Observer,
 	}
 
 	// Divide entries among shards
@@ -176,6 +215,9 @@ func (c *GlyphCache) Get(key OutlineCacheKey) *GlyphOutline {
 	if !ok {
 		shard.mu.Unlock()
 		c.stats.Misses.Add(1)
+		if c.observer != nil {
+			c.observer.OnOutlineAccess(key, false)
+		}
 		return nil
 	}
 
@@ -186,6 +228,9 @@ func (c *GlyphCache) Get(key OutlineCacheKey) *GlyphOutline {
 	shard.mu.Unlock()
 
 	c.stats.Hits.Add(1)
+	if c.observer != nil {
+		c.observer.OnOutlineAccess(key, true)
+	}
 	return outline
 }
 
@@ -195,18 +240,27 @@ func (c *GlyphCache) Set(key OutlineCacheKey, outline *GlyphOutline) {
 	if outline == nil {
 		return
 	}
+	// Keys that carry neither a font identity nor a generation would alias
+	// every font; that is always a call-site bug, and silently accepting it is
+	// exactly how hot-reload leaks happen. Reject it at the boundary.
+	if ValidateKey(key) != nil {
+		return
+	}
 
 	shard := c.getShard(key)
 	frame := c.currentFrame.Load()
 
 	shard.mu.Lock()
-	defer shard.mu.Unlock()
-
 	// Check if already exists
 	if existing, ok := shard.entries[key]; ok {
 		existing.outline = outline
 		existing.lastAccessFrame = frame
 		shard.moveToFront(existing)
+		shard.mu.Unlock()
+		c.stats.Insertions.Add(1)
+		if c.observer != nil {
+			c.observer.OnOutlineInsert(key)
+		}
 		return
 	}
 
@@ -227,7 +281,12 @@ func (c *GlyphCache) Set(key OutlineCacheKey, outline *GlyphOutline) {
 	shard.entries[key] = entry
 	shard.addToFront(entry)
 	shard.count++
+	shard.mu.Unlock()
+
 	c.stats.Insertions.Add(1)
+	if c.observer != nil {
+		c.observer.OnOutlineInsert(key)
+	}
 }
 
 // GetOrCreate retrieves a cached outline or creates one using the provided function.
@@ -248,6 +307,9 @@ func (c *GlyphCache) GetOrCreate(key OutlineCacheKey, create func() *GlyphOutlin
 			outline := entry.outline
 			shard.mu.Unlock()
 			c.stats.Hits.Add(1)
+			if c.observer != nil {
+				c.observer.OnOutlineAccess(key, true)
+			}
 			return outline
 		}
 		shard.mu.Unlock()
@@ -258,6 +320,9 @@ func (c *GlyphCache) GetOrCreate(key OutlineCacheKey, create func() *GlyphOutlin
 	// Need to create
 	if create == nil {
 		c.stats.Misses.Add(1)
+		if c.observer != nil {
+			c.observer.OnOutlineAccess(key, false)
+		}
 		return nil
 	}
 
@@ -266,8 +331,42 @@ func (c *GlyphCache) GetOrCreate(key OutlineCacheKey, create func() *GlyphOutlin
 		c.Set(key, outline)
 	} else {
 		c.stats.Misses.Add(1)
+		if c.observer != nil {
+			c.observer.OnOutlineAccess(key, false)
+		}
 	}
 	return outline
+}
+
+// DeleteSourceGeneration removes every entry produced by the given
+// FontSource generation. It returns the number of entries removed.
+//
+// Call this when a FontSource is closed (see FontSource.Close) so outlines
+// built from released font data are not retained by the cache. It is safe to
+// call concurrently with Get/Set/GetOrCreate/Clear; a concurrent insert of the
+// same generation may survive (the caller races with a Close, which is
+// inherently undefined), but no entry from another generation is touched.
+func (c *GlyphCache) DeleteSourceGeneration(generation uint64) int {
+	if generation == 0 {
+		return 0
+	}
+
+	removed := 0
+	for i := 0; i < numShards; i++ {
+		shard := c.shards[i]
+		shard.mu.Lock()
+		for key, entry := range shard.entries {
+			if key.SourceGeneration != generation {
+				continue
+			}
+			shard.remove(entry)
+			delete(shard.entries, key)
+			shard.count--
+			removed++
+		}
+		shard.mu.Unlock()
+	}
+	return removed
 }
 
 // Delete removes an entry from the cache.
@@ -288,6 +387,14 @@ func (c *GlyphCache) Delete(key OutlineCacheKey) {
 }
 
 // Clear removes all entries from the cache.
+//
+// Concurrency semantics: Clear takes each shard lock in turn and swaps the
+// shard map. A Get/GetOrCreate that completes before the corresponding shard
+// is cleared may still return an entry; a Set/GetOrCreate that completes after
+// may insert an entry that survives. Outline values already returned to a
+// caller remain valid — Clear only drops the cache's references. Callers that
+// need a strict "no entry observed after this point" guarantee must
+// synchronize with concurrent readers themselves.
 func (c *GlyphCache) Clear() {
 	for i := 0; i < numShards; i++ {
 		shard := c.shards[i]
@@ -347,6 +454,21 @@ func (c *GlyphCache) Len() int {
 	return total
 }
 
+// ValidateKey rejects cache keys that omit the source generation for a font
+// that can be hot-reloaded. It is a development/CI aid: checks that every key
+// inserted during a font lifecycle run carries a generation (or is a
+// documented bare-ParsedFont key with FontID != 0).
+//
+// The rule enforced here is: a key must not combine a zero generation with a
+// zero FontID, because that is the shape produced by a buggy call site that
+// forgot both discriminators and would alias every font.
+func ValidateKey(key OutlineCacheKey) error {
+	if key.FontID == 0 && key.SourceGeneration == 0 {
+		return fmt.Errorf("text: outline cache key has neither FontID nor SourceGeneration (gid=%d size=%d)", key.GID, key.Size)
+	}
+	return nil
+}
+
 // Stats returns cache statistics.
 func (c *GlyphCache) Stats() (hits, misses, evictions, insertions uint64) {
 	return c.stats.Hits.Load(),
@@ -384,6 +506,7 @@ func (c *GlyphCache) CurrentFrame() uint64 {
 func (c *GlyphCache) getShard(key OutlineCacheKey) *glyphShard {
 	// Hash the key to distribute across shards
 	h := key.FontID
+	h = h*31 + key.SourceGeneration
 	h = h*31 + uint64(key.GID)
 	// Size can be negative but we only use it for hashing, so cast is safe
 	h = h*31 + uint64(int64(key.Size)) //#nosec G115 -- hash only, value can be negative
@@ -491,16 +614,37 @@ func init() {
 
 // GetGlobalGlyphCache returns the global shared glyph cache.
 // It is safe to call concurrently with SetGlobalGlyphCache.
+//
+// GetGlobalGlyphCache never returns nil: the initial cache is installed at
+// package init and SetGlobalGlyphCache(nil) installs a fresh one.
 func GetGlobalGlyphCache() *GlyphCache {
 	return globalGlyphCache.Load()
 }
 
-// SetGlobalGlyphCache replaces the global glyph cache.
-// The old cache is returned for cleanup if needed.
+// SetGlobalGlyphCache replaces the global glyph cache and returns the
+// previous cache. If cache is nil a fresh default cache is installed.
 // It is safe for concurrent use.
+//
+// Concurrency semantics: the swap is atomic, but the returned cache may still
+// be in use by goroutines that loaded it before the swap. Do not call Clear()
+// on the returned cache while those goroutines may be running — dispose of it
+// only once you know no caller holds it. Caches are not reference counted.
 func SetGlobalGlyphCache(cache *GlyphCache) *GlyphCache {
 	if cache == nil {
 		cache = NewGlyphCache()
 	}
 	return globalGlyphCache.Swap(cache)
+}
+
+// ClearGlobalGlyphCache clears the current global glyph cache in place and
+// returns it. This is the supported way to invalidate every globally cached
+// outline (e.g. after a font hot-reload) without invalidating pointers that
+// renderers already hold.
+//
+// It is safe for concurrent use; see [GlyphCache.Clear] for the exact
+// race semantics.
+func ClearGlobalGlyphCache() *GlyphCache {
+	cache := GetGlobalGlyphCache()
+	cache.Clear()
+	return cache
 }

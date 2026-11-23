@@ -149,7 +149,8 @@ func (b *GlyphRunBuilder) Build(createGlyph func(fontID uint64, glyphID GlyphID,
 	for i := range b.instances {
 		inst := &b.instances[i]
 
-		// Build cache key
+		// Build cache key. GlyphRunBuilder callers supply a raw FontID and have
+		// no FontSource, so SourceGeneration is zero by contract.
 		key := OutlineCacheKey{
 			FontID:  inst.FontID,
 			GID:     inst.GlyphID,
@@ -207,7 +208,8 @@ func (b *GlyphRunBuilder) BuildTransformed(
 	for i := range b.instances {
 		inst := &b.instances[i]
 
-		// Build cache key
+		// Build cache key. GlyphRunBuilder callers supply a raw FontID and have
+		// no FontSource, so SourceGeneration is zero by contract.
 		key := OutlineCacheKey{
 			FontID:  inst.FontID,
 			GID:     inst.GlyphID,

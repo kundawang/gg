@@ -119,20 +119,9 @@ func (r *GlyphRenderer) RenderGlyph(
 		return nil
 	}
 
-	// Get font ID for cache key
-	fontID := computeFontID(font)
-
-	// ADR-054: pass variations for variable font gvar deltas.
-	varHash := VariationHash(params.Variations)
-
-	// Build cache key
-	key := OutlineCacheKey{
-		FontID:        fontID,
-		GID:           glyph.GID,
-		Size:          sizeToInt16(size),
-		Hinting:       HintingNone,
-		VariationHash: varHash,
-	}
+	// Build cache key. Bare ParsedFont callers have no FontSource, so the
+	// generation component stays zero (see outlineKeyForFont).
+	key := outlineKeyForFont(font, glyph.GID, size, HintingNone, params.Variations)
 
 	// Get or create outline
 	outline := r.cache.GetOrCreate(key, func() *GlyphOutline {
@@ -266,7 +255,14 @@ func (r *GlyphRenderer) transformOutline(
 
 // computeFontID generates a unique ID for a font based on its properties.
 // This uses FNV-1a hash of font name and number of glyphs.
+//
+// It is the bare-ParsedFont counterpart of [ComputeFontID]. Prefer
+// [outlineKeyForFont] when building cache keys so the key format stays
+// centralized.
 func computeFontID(font ParsedFont) uint64 {
+	if font == nil {
+		return 0
+	}
 	const (
 		fnvOffset = 14695981039346656037
 		fnvPrime  = 1099511628211

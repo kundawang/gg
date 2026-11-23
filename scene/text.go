@@ -9,6 +9,11 @@ import (
 	"github.com/gogpu/gg/text"
 )
 
+// ErrClosedFontSource is returned when rendering text whose FontSource has
+// already been closed. It wraps [text.ErrFontSourceClosed] so callers can test
+// either sentinel with errors.Is.
+var ErrClosedFontSource = fmt.Errorf("scene: font source is closed: %w", text.ErrFontSourceClosed)
+
 // TextRenderer converts shaped text to scene paths for GPU rendering.
 // It supports glyph outlines and handles positioning, transforms, and caching.
 //
@@ -150,6 +155,9 @@ func (r *TextRenderer) RenderGlyph(glyph text.ShapedGlyph, face text.Face) (*Ren
 	}
 	size := face.Size()
 	parsed := source.Parsed()
+	if parsed == nil {
+		return nil, ErrClosedFontSource
+	}
 
 	cache := r.ensureCache()
 	fontID := computeSceneTextFontID(source)
@@ -160,11 +168,12 @@ func (r *TextRenderer) RenderGlyph(glyph text.ShapedGlyph, face text.Face) (*Ren
 	varHash := text.VariationHash(variations)
 
 	cacheKey := text.OutlineCacheKey{
-		FontID:        fontID,
-		GID:           glyph.GID,
-		Size:          sizeKey,
-		Hinting:       text.HintingNone,
-		VariationHash: varHash,
+		FontID:           fontID,
+		SourceGeneration: source.Generation(),
+		GID:              glyph.GID,
+		Size:             sizeKey,
+		Hinting:          text.HintingNone,
+		VariationHash:    varHash,
 	}
 	outline := cache.GetOrCreate(cacheKey, func() *text.GlyphOutline {
 		o, err := r.extractor.ExtractOutlineHintedVar(parsed, glyph.GID, size, text.HintingNone, variations)
@@ -217,10 +226,14 @@ func (r *TextRenderer) RenderGlyphs(glyphs []text.ShapedGlyph, face text.Face) (
 	}
 	size := face.Size()
 	parsed := source.Parsed()
+	if parsed == nil {
+		return nil, ErrClosedFontSource
+	}
 
 	cache := r.ensureCache()
 	fontID := computeSceneTextFontID(source)
 	sizeKey := computeSizeKey(size)
+	generation := source.Generation()
 
 	// ADR-054: pass variations for variable font gvar deltas.
 	variations := face.Variations()
@@ -239,11 +252,12 @@ func (r *TextRenderer) RenderGlyphs(glyphs []text.ShapedGlyph, face text.Face) (
 		}
 
 		cacheKey := text.OutlineCacheKey{
-			FontID:        fontID,
-			GID:           glyph.GID,
-			Size:          sizeKey,
-			Hinting:       text.HintingNone,
-			VariationHash: varHash,
+			FontID:           fontID,
+			SourceGeneration: generation,
+			GID:              glyph.GID,
+			Size:             sizeKey,
+			Hinting:          text.HintingNone,
+			VariationHash:    varHash,
 		}
 		outline := cache.GetOrCreate(cacheKey, func() *text.GlyphOutline {
 			o, err := r.extractor.ExtractOutlineHintedVar(parsed, glyph.GID, size, text.HintingNone, variations)

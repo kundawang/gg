@@ -106,6 +106,15 @@ jobs:
         CGO_ENABLED: "1"
       run: go test -race -count=1 ./...
 
+    # Font cache lifecycle gate: two sources with the same FontID but different
+    # outlines, a hot reload and a close in between. Fails if the reloaded font
+    # reuses the closed source's outlines or if hits are attributed to a purged
+    # generation. Mirrors text/fontlifecycle_quality_test.go.
+    - name: Font cache lifecycle gate
+      if: matrix.os == 'ubuntu-latest'
+      shell: bash
+      run: go run ./cmd/ggfontcheck
+
     - name: Verify coverage file
       if: matrix.os == 'ubuntu-latest'
       shell: bash

@@ -200,9 +200,23 @@ func TestFontSourceClose(t *testing.T) {
 		t.Errorf("Close() failed: %v", err)
 	}
 
-	// After close, data should be nil
-	if source.data != nil {
+	// After close, data and parsed font must be released.
+	source.mu.RLock()
+	data, parsed := source.data, source.parsed
+	source.mu.RUnlock()
+	if data != nil {
 		t.Error("expected data to be nil after Close()")
+	}
+	if parsed != nil {
+		t.Error("expected parsed font to be nil after Close()")
+	}
+	if !source.Closed() {
+		t.Error("Closed() = false after Close()")
+	}
+
+	// Close is idempotent.
+	if err := source.Close(); err != nil {
+		t.Errorf("second Close() failed: %v", err)
 	}
 }
 

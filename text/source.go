@@ -5,7 +5,17 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 )
+
+// fontSourceGeneration issues process-unique FontSource generations.
+// Generation 0 is reserved for "no source".
+var fontSourceGeneration atomic.Uint64
+
+// nextFontSourceGeneration returns a new, process-unique generation number.
+func nextFontSourceGeneration() uint64 {
+	return fontSourceGeneration.Add(1)
+}
 
 // FontSource represents a loaded font file.
 // One FontSource can create multiple Face instances at different sizes.
@@ -13,10 +23,28 @@ import (
 //
 // FontSource is safe for concurrent use.
 // FontSource must not be copied after creation (enforced by copyCheck).
+//
+// # Lifecycle
+//
+// A FontSource owns its parsed font and any lazily built per-font structures
+// (TT hint cache, CFF program, table slices). Close releases that ownership:
+// afterwards Parsed, data-bearing methods and outline reads fail with
+// ErrFontSourceClosed rather than touching released data. Faces created before
+// Close report an error/empty result instead of a panic.
+//
+// Each FontSource has a Generation valid from construction (never zero). Cache
+// keys embed the generation via [OutlineCacheKey.SourceGeneration], so a font
+// reloaded from the same path — and therefore carrying the same FontID —
+// never resolves outlines cached for the previous source. Close additionally
+// purges this generation's entries from the global glyph cache.
 type FontSource struct {
 	// addr is used for copy protection (Ebitengine pattern).
 	// It must point to the FontSource itself.
 	addr *FontSource
+
+	// generation is a process-unique identity for this source instance.
+	// It is immutable and remains valid after Close (for cache purging).
+	generation uint64
 
 	// Font data
 	data   []byte
@@ -28,10 +56,14 @@ type FontSource struct {
 	// Mutex protects caches and internal state
 	mu sync.RWMutex
 
-	// Caches (to be implemented in TASK-044)
-	// shapingCache  *Cache[shapingKey, []Glyph]
-	// glyphCache    *Cache[glyphKey, *GlyphImage]
-	// hasGlyphCache *runeToBoolMap
+	// closed is set once Close has released the source's data. It is
+	// protected by mu; readers that need the parsed font must re-check
+	// under the lock.
+	closed bool
+
+	// closeErr is returned by every Close call after the first, making
+	// Close idempotent and deterministic for tests.
+	closeErr error
 
 	// Configuration
 	config sourceConfig
@@ -54,7 +86,10 @@ func NewFontSource(data []byte, opts ...SourceOption) (*FontSource, error) {
 
 	// Get parser and parse the font.
 	// If collection index is set (or data is a .ttc/.otc), use ParseIndex.
-	parser := getParser(config.parserName)
+	parser := config.parser
+	if parser == nil {
+		parser = getParser(config.parserName)
+	}
 	var parsed ParsedFont
 	var err error
 	if indexer, ok := parser.(interface {
@@ -67,6 +102,9 @@ func NewFontSource(data []byte, opts ...SourceOption) (*FontSource, error) {
 	if err != nil {
 		return nil, err
 	}
+	if parsed == nil {
+		return nil, ErrFontSourceNotParsed
+	}
 
 	// Copy the data
 	dataCopy := make([]byte, len(data))
@@ -74,11 +112,18 @@ func NewFontSource(data []byte, opts ...SourceOption) (*FontSource, error) {
 
 	// Create FontSource
 	s := &FontSource{
-		data:   dataCopy,
-		parsed: parsed,
-		config: config,
+		generation: nextFontSourceGeneration(),
+		data:       dataCopy,
+		parsed:     parsed,
+		config:     config,
 	}
 	s.addr = s // Self-reference for copy detection
+
+	// A parser double may want to build cache keys. Give it the generation of
+	// the source that owns it. Production parsers do not implement the hook.
+	if hook, ok := parsed.(interface{ SetSourceGeneration(uint64) }); ok {
+		hook.SetSourceGeneration(s.generation)
+	}
 
 	// Extract font name
 	s.name = extractFontName(parsed)
@@ -102,6 +147,8 @@ func NewFontSourceFromFile(path string, opts ...SourceOption) (*FontSource, erro
 //
 // Face is a lightweight object that shares caches with the FontSource.
 // Panics if s is nil (e.g. when NewFontSourceFromFile error was ignored).
+// Creating a Face from a closed source returns a face whose data-bearing
+// operations report [ErrFontSourceClosed].
 func (s *FontSource) Face(size float64, opts ...FaceOption) Face {
 	if s == nil {
 		panic("text: FontSource is nil — did you check the error from NewFontSourceFromFile?")
@@ -124,31 +171,102 @@ func (s *FontSource) Face(size float64, opts ...FaceOption) Face {
 }
 
 // Name returns the font name.
+// The name is captured at construction and remains readable after Close.
 func (s *FontSource) Name() string {
 	s.copyCheck()
 	return s.name
 }
 
+// Generation returns the process-unique identity of this FontSource.
+// It is non-zero for every source created by [NewFontSource] and is never
+// reused. Cache keys embed it via [OutlineCacheKey.SourceGeneration].
+func (s *FontSource) Generation() uint64 {
+	if s == nil {
+		return 0
+	}
+	return s.generation
+}
+
 // Parsed returns the parsed font for advanced operations.
 // This is primarily used by Face implementations.
+//
+// Parsed returns nil after Close; callers must handle a nil result rather
+// than dereferencing a released parser. Use [FontSource.ParsedErr] when the
+// distinction between "closed" and "no parser" matters.
 func (s *FontSource) Parsed() ParsedFont {
 	s.copyCheck()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil
+	}
 	return s.parsed
 }
 
+// ParsedErr returns the parsed font, or an error explaining why it is not
+// available. It returns [ErrFontSourceClosed] after Close and
+// [ErrFontSourceNotParsed] when the source was created without a parser.
+//
+// This is the error-aware variant used by operations that must report the
+// first failure (glyph + size) instead of silently drawing nothing.
+func (s *FontSource) ParsedErr() (ParsedFont, error) {
+	s.copyCheck()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, ErrFontSourceClosed
+	}
+	if s.parsed == nil {
+		return nil, ErrFontSourceNotParsed
+	}
+	return s.parsed, nil
+}
+
+// Closed reports whether Close has released this source's data.
+func (s *FontSource) Closed() bool {
+	if s == nil {
+		return true
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.closed
+}
+
 // Close releases resources associated with the FontSource.
-// All faces created from this source become invalid after Close.
+// All faces created from this source become invalid after Close: their
+// data-bearing methods report [ErrFontSourceClosed] instead of reading
+// released font bytes.
+//
+// Close is idempotent and safe for concurrent use. Repeated calls return the
+// result of the first call. Closing also purges this source generation's
+// outlines from the global glyph cache, so a later source loaded from the same
+// path cannot observe them.
 func (s *FontSource) Close() error {
 	s.copyCheck()
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.closed {
+		err := s.closeErr
+		s.mu.Unlock()
+		return err
+	}
+	s.closed = true
 
-	// Clear data
+	// Clear data. The parsed font may own lazily built structures
+	// (TT hint cache, CFF program, table slices); dropping the reference
+	// releases them once concurrent readers drain.
 	s.data = nil
 	s.parsed = nil
+	s.closeErr = nil
+	generation := s.generation
+	s.mu.Unlock()
 
-	// Clear caches (when implemented in TASK-044)
+	// Drop cached outlines produced from the now-released font data.
+	// This runs outside the source lock: the cache has its own locking and
+	// observers must not be invoked while holding s.mu.
+	if generation != 0 {
+		GetGlobalGlyphCache().DeleteSourceGeneration(generation)
+	}
 
 	return nil
 }

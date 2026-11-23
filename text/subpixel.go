@@ -388,20 +388,29 @@ func (c *SubpixelCache) HitRate() float64 {
 // toOutlineKey converts a SubpixelKey to an OutlineCacheKey.
 // The subpixel position is encoded into the FontID using bit manipulation.
 func (c *SubpixelCache) toOutlineKey(key SubpixelKey) OutlineCacheKey {
-	// Encode subpixel position into the top bits of FontID.
-	// This ensures that the same glyph at different subpixel positions
-	// has different cache keys.
+	// Fold the subpixel position into the variation hash rather than the
+	// FontID. FontID is a stable font fingerprint; mutating it would make the
+	// key disagree with every other outline key for the same font and, worse,
+	// could collapse SourceGeneration distinctions if the shift overflowed.
+	// VariationHash is a pure discriminator, so it is the correct place.
 	//
-	// Layout: [original FontID (48 bits)][SubX (8 bits)][SubY (8 bits)]
-	encodedFontID := key.FontID
-	encodedFontID = (encodedFontID << 8) | uint64(key.SubX)
-	encodedFontID = (encodedFontID << 8) | uint64(key.SubY)
+	// Layout: hash(original VariationHash, SubX, SubY)
+	subHash := key.VariationHash
+	subHash = subHash*31 + uint64(key.SubX)
+	subHash = subHash*31 + uint64(key.SubY)
+	if subHash == 0 {
+		// Never let a subpixel-encoded key collide with the "no variation"
+		// sentinel value used by unencoded keys.
+		subHash = 1
+	}
 
 	return OutlineCacheKey{
-		FontID:  encodedFontID,
-		GID:     key.GID,
-		Size:    key.Size,
-		Hinting: key.Hinting,
+		FontID:           key.FontID,
+		SourceGeneration: key.SourceGeneration,
+		GID:              key.GID,
+		Size:             key.Size,
+		Hinting:          key.Hinting,
+		VariationHash:    subHash,
 	}
 }
 

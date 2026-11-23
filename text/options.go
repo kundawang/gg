@@ -130,7 +130,8 @@ type SourceOption func(*sourceConfig)
 type sourceConfig struct {
 	cacheLimit      int
 	parserName      string
-	collectionIndex int // Font index within .ttc/.otc collection (default 0)
+	parser          FontParser // direct parser injection (overrides parserName)
+	collectionIndex int        // Font index within .ttc/.otc collection (default 0)
 }
 
 // defaultSourceConfig returns the default source configuration.
@@ -168,6 +169,19 @@ func WithCollectionIndex(index int) SourceOption {
 func WithParser(name string) SourceOption {
 	return func(c *sourceConfig) {
 		c.parserName = name
+	}
+}
+
+// WithFontParser injects a parser instance directly for this source, without
+// touching the process-wide parser registry. It takes precedence over
+// [WithParser].
+//
+// This is the supported seam for tests and embedding hosts that supply a
+// FontSource/ParsedFont double (for example to simulate a hot reload, count
+// parses, or return controlled glyph outlines).
+func WithFontParser(parser FontParser) SourceOption {
+	return func(c *sourceConfig) {
+		c.parser = parser
 	}
 }
 

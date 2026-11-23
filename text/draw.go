@@ -1,18 +1,84 @@
 package text
 
 import (
+	"context"
+	"fmt"
 	"image"
 	"image/color"
 	"image/draw"
 	"math"
+	"reflect"
 )
+
+// GlyphDrawError reports the first glyph that failed to render.
+//
+// Draw, DrawAliased and their error-aware variants render as much as they can
+// and report the first failure rather than aborting mid-string. GID and Size
+// identify the glyph and ppem; Rune is the source rune (or -1 when the glyph
+// could not be resolved, e.g. a closed FontSource). Err is the underlying
+// cause and supports errors.Is/As.
+type GlyphDrawError struct {
+	// GID is the glyph index that failed (0 when unresolvable).
+	GID GlyphID
+
+	// Rune is the source rune for GID, or -1 when unknown.
+	Rune rune
+
+	// Size is the font size in ppem (device pixels per em) used for GID.
+	Size float64
+
+	// Err is the underlying cause.
+	Err error
+}
+
+// Error implements error.
+func (e *GlyphDrawError) Error() string {
+	return fmt.Sprintf("text: failed to draw glyph gid=%d rune=%U size=%.2fpx: %v",
+		e.GID, e.Rune, e.Size, e.Err)
+}
+
+// Unwrap exposes the underlying cause.
+func (e *GlyphDrawError) Unwrap() error { return e.Err }
 
 // Draw renders text to a destination image.
 // Position (x, y) is the baseline origin.
 // Supports sourceFace, MultiFace, and FilteredFace.
+//
+// Draw best-effort renders and discards per-glyph errors. Use [DrawErr] when
+// the first failing glyph (and its size) must be reported, or [DrawContext]
+// for cancellation.
 func Draw(dst draw.Image, text string, face Face, x, y float64, col color.Color) {
+	_ = DrawErr(dst, text, face, x, y, col)
+}
+
+// DrawErr renders text like [Draw] and returns the first per-glyph failure as
+// a [*GlyphDrawError]. Rendering continues past a failing glyph so the output
+// matches [Draw] exactly; only the report differs.
+//
+// A closed FontSource yields a *GlyphDrawError wrapping
+// [ErrFontSourceClosed] instead of reading released font data.
+func DrawErr(dst draw.Image, text string, face Face, x, y float64, col color.Color) error {
+	return drawWithContext(context.Background(), dst, text, face, x, y, col)
+}
+
+// DrawContext renders text like [Draw] but stops when ctx is canceled.
+// Cancellation is checked before the first glyph and before every glyph.
+// It returns ctx.Err() on cancellation, or the first per-glyph error.
+//
+// DrawContext never starts a goroutine, so canceling cannot leak one.
+func DrawContext(ctx context.Context, dst draw.Image, text string, face Face, x, y float64, col color.Color) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return drawWithContext(ctx, dst, text, face, x, y, col)
+}
+
+func drawWithContext(ctx context.Context, dst draw.Image, text string, face Face, x, y float64, col color.Color) error {
 	if text == "" || face == nil {
-		return
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	// Expand tabs to spaces for bitmap rendering.
@@ -22,12 +88,13 @@ func Draw(dst draw.Image, text string, face Face, x, y float64, col color.Color)
 
 	switch f := face.(type) {
 	case *sourceFace:
-		drawSourceFace(dst, text, f, x, y, col)
+		return drawSourceFaceContext(ctx, dst, text, f, x, y, col)
 	case *MultiFace:
 		drawMultiFace(dst, text, f, x, y, col)
 	case *FilteredFace:
 		drawFilteredFace(dst, text, f, x, y, col)
 	}
+	return ctx.Err()
 }
 
 // glyphRasterMode selects the rasterization coverage mode.
@@ -66,19 +133,22 @@ type glyphRasterizeFunc func(
 // This matches skrifa/FreeType/Skia: when TT hinting runs on a glyph, the
 // hinted advance replaces the raw hmtx advance for positioning.
 func drawGlyphs(
+	ctx context.Context,
 	dst draw.Image,
 	sf *sourceFace,
 	text string,
 	x, y float64,
 	col color.Color,
 	rasterize glyphRasterizeFunc,
-) {
+) error {
 	if vars := sf.Variations(); len(vars) > 0 {
-		drawGlyphsVariable(dst, sf, text, x, y, col, vars, rasterModeAA)
-		return
+		return drawGlyphsVariable(ctx, dst, sf, text, x, y, col, vars, rasterModeAA)
 	}
 
-	parsed := sf.source.Parsed()
+	parsed, err := sf.source.ParsedErr()
+	if err != nil {
+		return firstGlyphError(text, sf.size, err)
+	}
 	ppem := sf.size
 	hinting := sf.config.hinting
 
@@ -97,8 +167,15 @@ func drawGlyphs(
 	rast := NewGlyphMaskRasterizer()
 	src := image.NewUniform(col)
 
+	var firstErr error
 	advanceX := 0.0
 	for glyph := range sf.Glyphs(text) {
+		if err := ctx.Err(); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			break
+		}
 		if glyph.GID == 0 {
 			// Space and other no-outline glyphs: use unhinted advance.
 			// These have no TT bytecode and phantom points would be trivial.
@@ -115,8 +192,15 @@ func drawGlyphs(
 		subpixelX := glyphX - intX
 		subpixelY := glyphY - intY
 
-		result, err := rasterize(rast, parsed, glyph.GID, ppem, subpixelX, subpixelY, hinting)
-		if err != nil || result == nil {
+		result, rErr := rasterizeCachedOutline(rasterize, rast, sf.source, parsed, glyph.GID, ppem, subpixelX, subpixelY, hinting)
+		if rErr != nil {
+			if firstErr == nil {
+				firstErr = &GlyphDrawError{GID: glyph.GID, Rune: glyph.Rune, Size: ppem, Err: rErr}
+			}
+			advanceX += hintedOrRawAdvance(ttCache, glyph, ppem)
+			continue
+		}
+		if result == nil {
 			advanceX += hintedOrRawAdvance(ttCache, glyph, ppem)
 			continue
 		}
@@ -136,6 +220,7 @@ func drawGlyphs(
 		// Advance cursor using hinted advance when TT hinting is active.
 		advanceX += hintedOrRawAdvance(ttCache, glyph, ppem)
 	}
+	return firstErr
 }
 
 // hintedOrRawAdvance returns the TT hinted advance for a glyph if available,
@@ -179,6 +264,7 @@ func hintedOrRawAdvance(ttCache *ttHintCache, glyph Glyph, ppem float64) float64
 // The mode parameter selects coverage computation (Skia pattern: outline source
 // and rasterization mode are orthogonal — variable fonts don't affect AA choice).
 func drawGlyphsVariable(
+	ctx context.Context,
 	dst draw.Image,
 	sf *sourceFace,
 	text string,
@@ -186,26 +272,40 @@ func drawGlyphsVariable(
 	col color.Color,
 	variations []FontVariation,
 	mode glyphRasterMode,
-) {
+) error {
 	source := sf.source
-	parsed := source.Parsed()
-	if _, ok := parsed.(*ownParsedFont); !ok {
-		return
+	parsed, err := source.ParsedErr()
+	if err != nil {
+		return firstGlyphError(text, sf.size, err)
+	}
+	// Production sources use the own parser's gvar path. Parser doubles are
+	// allowed too, so their geometry and cache accounting are exercised under
+	// variations (ADR-054) as well.
+	if _, isOwn := parsed.(*ownParsedFont); !isOwn {
+		if _, isDouble := parsed.(outlineSource); !isDouble {
+			return nil
+		}
 	}
 
 	ppem := sf.size
 	hinting := sf.config.hinting
 	rast := NewGlyphMaskRasterizer()
 	src := image.NewUniform(col)
-	extractor := &OutlineExtractor{}
 
 	// HVAR takes priority over TT-hinted phantom advances for positioning.
 	// FreeType ttgload.c:964-977: when HVAR present and hinting active,
 	// discard TT-hinted phantoms and use HVAR-adjusted advance instead.
 	varProv, _ := parsed.(VariableAdvanceProvider)
 
+	var firstErr error
 	advanceX := 0.0
 	for _, r := range text {
+		if err := ctx.Err(); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			break
+		}
 		if r < 0x20 && r != '\t' {
 			continue
 		}
@@ -226,7 +326,14 @@ func drawGlyphsVariable(
 
 		// Unified gvar + hinting path (skrifa load_simple parity).
 		// ExtractOutlineHintedVar applies gvar deltas THEN hinting in one pass.
-		outline, _ := extractor.ExtractOutlineHintedVar(parsed, gid, ppem, hinting, variations)
+		outline, xErr := extractOutlineForDraw(sf.source, parsed, gid, ppem, hinting, variations)
+		if xErr != nil {
+			if firstErr == nil {
+				firstErr = &GlyphDrawError{GID: gid, Rune: r, Size: ppem, Err: xErr}
+			}
+			advanceX += varOrRawAdvance(varProv, parsed, uint16(gid), ppem, variations)
+			continue
+		}
 		if outline == nil || outline.IsEmpty() {
 			advanceX += varOrRawAdvance(varProv, parsed, uint16(gid), ppem, variations)
 			continue
@@ -240,7 +347,14 @@ func drawGlyphsVariable(
 		default:
 			result, rErr = rast.RasterizeOutline(outline, subpixelX, subpixelY)
 		}
-		if rErr != nil || result == nil {
+		if rErr != nil {
+			if firstErr == nil {
+				firstErr = &GlyphDrawError{GID: gid, Rune: r, Size: ppem, Err: rErr}
+			}
+			advanceX += varOrRawAdvance(varProv, parsed, uint16(gid), ppem, variations)
+			continue
+		}
+		if result == nil {
 			advanceX += varOrRawAdvance(varProv, parsed, uint16(gid), ppem, variations)
 			continue
 		}
@@ -259,6 +373,22 @@ func drawGlyphsVariable(
 
 		advanceX += varOrRawAdvance(varProv, parsed, uint16(gid), ppem, variations)
 	}
+	return firstErr
+}
+
+// firstGlyphError builds the error reported when a face cannot render at all
+// (for example because its FontSource was closed). It names the first
+// drawable rune and the requested size so callers can pinpoint the failure.
+func firstGlyphError(text string, size float64, err error) error {
+	r := rune(-1)
+	for _, candidate := range text {
+		if candidate < 0x20 && candidate != '\t' {
+			continue
+		}
+		r = candidate
+		break
+	}
+	return &GlyphDrawError{GID: 0, Rune: r, Size: size, Err: err}
 }
 
 // varOrRawAdvance returns the HVAR advance when available, raw hmtx otherwise.
@@ -267,6 +397,47 @@ func varOrRawAdvance(varProv VariableAdvanceProvider, parsed ParsedFont, gid uin
 		return varProv.GlyphAdvanceVar(gid, ppem, variations)
 	}
 	return parsed.GlyphAdvance(gid, ppem)
+}
+
+// rasterizeCachedOutline extracts the outline through the cache and rasterizes
+// it, bypassing GlyphMaskRasterizer's internal (uncached) extraction.
+//
+// The extraction/rasterization split is passed in so aliased draws keep using
+// the NoAAFiller: the glyphRasterizeFunc callbacks differ only in how the
+// outline is turned into coverage.
+func rasterizeCachedOutline(
+	rasterize glyphRasterizeFunc,
+	rast *GlyphMaskRasterizer,
+	source *FontSource,
+	parsed ParsedFont,
+	gid GlyphID,
+	ppem, subpixelX, subpixelY float64,
+	hinting Hinting,
+) (*GlyphMaskResult, error) {
+	if rast == nil {
+		rast = NewGlyphMaskRasterizer()
+	}
+	// Extract once through the shared outline cache (which embeds FontID,
+	// source generation and variation) and rasterize the cached outline. This
+	// keeps AA and aliased draws on the same cached geometry while preserving
+	// their distinct coverage fillers.
+	outline, err := extractOutlineForDraw(source, parsed, gid, ppem, hinting, nil)
+	if err != nil {
+		return nil, err
+	}
+	if outline == nil || outline.IsEmpty() {
+		return nil, nil //nolint:nilnil // empty glyph
+	}
+	if isAliasedRasterizer(rasterize) {
+		return rast.RasterizeOutlineAliased(outline, subpixelX, subpixelY)
+	}
+	return rast.RasterizeOutline(outline, subpixelX, subpixelY)
+}
+
+// isAliasedRasterizer distinguishes the aliased callback. The two callbacks
+// are package-level functions; comparing them is stable and allocation-free.
+func isAliasedRasterizer(rasterize glyphRasterizeFunc) bool {
+	return reflect.ValueOf(rasterize).Pointer() == reflect.ValueOf(rasterizeAliasedGlyph).Pointer()
 }
 
 // rasterizeHintedGlyph rasterizes a glyph with 256-level analytic AA coverage.
@@ -304,7 +475,13 @@ func rasterizeAliasedGlyph(
 // HintingNone advances (ADR-039), while outline rasterization still uses
 // the face's configured hinting for crisp stems.
 func drawSourceFace(dst draw.Image, text string, sf *sourceFace, x, y float64, col color.Color) {
-	drawGlyphs(dst, sf, text, x, y, col, rasterizeHintedGlyph)
+	_ = drawGlyphs(context.Background(), dst, sf, text, x, y, col, rasterizeHintedGlyph)
+}
+
+// drawSourceFaceContext is drawSourceFace with cancellation and error
+// reporting. It is used by DrawContext/DrawErr.
+func drawSourceFaceContext(ctx context.Context, dst draw.Image, text string, sf *sourceFace, x, y float64, col color.Color) error {
+	return drawGlyphs(ctx, dst, sf, text, x, y, col, rasterizeHintedGlyph)
 }
 
 // drawMultiFace renders text using a MultiFace, selecting the appropriate font for each rune.

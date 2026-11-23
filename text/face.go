@@ -64,8 +64,13 @@ type sourceFace struct {
 }
 
 // Metrics implements Face.Metrics.
+// After the underlying FontSource is closed, Metrics returns the zero value
+// instead of reading released font data.
 func (f *sourceFace) Metrics() Metrics {
 	parsed := f.source.Parsed()
+	if parsed == nil {
+		return Metrics{}
+	}
 	fontMetrics := parsed.Metrics(f.size)
 
 	// FontMetrics.Descent is negative (below baseline)
@@ -100,6 +105,9 @@ type advanceResolver struct {
 
 func newAdvanceResolver(f *sourceFace) advanceResolver {
 	parsed := f.source.Parsed()
+	if parsed == nil {
+		return advanceResolver{size: f.size, variations: f.config.variations}
+	}
 
 	var varProv VariableAdvanceProvider
 	if len(f.config.variations) > 0 {
@@ -150,6 +158,9 @@ func (ar *advanceResolver) advance(gid uint16) float64 {
 // Matches drawGlyphs positioning to prevent cursor drift (#479).
 func (f *sourceFace) Advance(text string) float64 {
 	ar := newAdvanceResolver(f)
+	if ar.parsed == nil {
+		return 0
+	}
 	total := 0.0
 	for _, r := range text {
 		if r < 0x20 && r != '\t' {
@@ -168,6 +179,9 @@ func (f *sourceFace) Advance(text string) float64 {
 // HasGlyph implements Face.HasGlyph.
 func (f *sourceFace) HasGlyph(r rune) bool {
 	parsed := f.source.Parsed()
+	if parsed == nil {
+		return false
+	}
 	gid := parsed.GlyphIndex(r)
 	return gid != 0
 }
@@ -180,6 +194,9 @@ func (f *sourceFace) HasGlyph(r rune) bool {
 func (f *sourceFace) Glyphs(text string) iter.Seq[Glyph] {
 	return func(yield func(Glyph) bool) {
 		ar := newAdvanceResolver(f)
+		if ar.parsed == nil {
+			return
+		}
 		x := 0.0
 		byteIndex := 0
 
@@ -227,6 +244,9 @@ func (f *sourceFace) Glyphs(text string) iter.Seq[Glyph] {
 // AppendGlyphs implements Face.AppendGlyphs.
 func (f *sourceFace) AppendGlyphs(dst []Glyph, text string) []Glyph {
 	ar := newAdvanceResolver(f)
+	if ar.parsed == nil {
+		return dst
+	}
 	x := 0.0
 	byteIndex := 0
 

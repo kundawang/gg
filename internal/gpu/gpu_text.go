@@ -122,6 +122,10 @@ func (e *GPUTextEngine) LayoutText(
 		return TextBatch{}, fmt.Errorf("MSDF text: face has no FontSource (MultiFace requires ADR-065)")
 	}
 	fontID := computeFontID(fontSource)
+	parsed, parsedErr := fontSource.ParsedErr()
+	if parsedErr != nil {
+		return TextBatch{}, fmt.Errorf("MSDF text: %w", parsedErr)
+	}
 
 	// ADR-054: pass variations for variable font gvar deltas.
 	variations := face.Variations()
@@ -169,7 +173,7 @@ func (e *GPUTextEngine) LayoutText(
 			ratio = logicalSize / refSize
 		}
 
-		outline, err := e.extractor.ExtractOutlineHintedVar(fontSource.Parsed(), glyph.GID, glyphRefSize, text.HintingNone, variations)
+		outline, err := e.extractor.ExtractOutlineHintedVar(parsed, glyph.GID, glyphRefSize, text.HintingNone, variations)
 		if err != nil || outline == nil || outline.IsEmpty() {
 			outlineSkip++
 			continue
@@ -314,9 +318,11 @@ func (e *GPUTextEngine) GlyphCount() int {
 	return e.atlasManager.GlyphCount()
 }
 
-// computeFontID generates a stable hash identifier for a font source.
-// Delegates to text.ComputeFontID which uses FullName to prevent cache
-// collisions between faces in the same family (e.g., Regular vs Bold).
+// computeFontID generates a cache discriminator for a font source.
+//
+// Delegates to text.ComputeFontID (stable FontID) and folds in the source
+// generation so hot-reloaded fonts cannot reuse atlas entries built from the
+// closed source. See computeGlyphMaskFontID for the mixing scheme.
 func computeFontID(source *text.FontSource) uint64 {
-	return text.ComputeFontID(source)
+	return computeGlyphMaskFontID(source)
 }

@@ -130,7 +130,10 @@ func (e *GlyphMaskEngine) LayoutText(
 		return GlyphMaskBatch{}, fmt.Errorf("glyph mask: face has no FontSource (MultiFace requires ADR-065)")
 	}
 	fontID := computeGlyphMaskFontID(fontSource)
-	parsed := fontSource.Parsed()
+	parsed, parsedErr := fontSource.ParsedErr()
+	if parsedErr != nil {
+		return GlyphMaskBatch{}, fmt.Errorf("glyph mask: %w", parsedErr)
+	}
 
 	// Detect CJK script from first rune (ADR-027). CJK text uses reduced
 	// hinting to avoid stroke collapse on dense parallel strokes.
@@ -191,7 +194,10 @@ func (e *GlyphMaskEngine) LayoutTextAliased(
 		return GlyphMaskBatch{}, fmt.Errorf("glyph mask aliased: face has no FontSource (MultiFace requires ADR-065)")
 	}
 	fontID := computeGlyphMaskFontID(fontSource)
-	parsed := fontSource.Parsed()
+	parsed, parsedErr := fontSource.ParsedErr()
+	if parsedErr != nil {
+		return GlyphMaskBatch{}, fmt.Errorf("glyph mask: %w", parsedErr)
+	}
 
 	isCJK := false
 	for _, r := range s {
@@ -277,7 +283,10 @@ func (e *GlyphMaskEngine) layoutShapedGlyphs(
 		return GlyphMaskBatch{}, fmt.Errorf("glyph mask shaped: face has no FontSource (MultiFace requires ADR-065)")
 	}
 	fontID := computeGlyphMaskFontID(fontSource)
-	parsed := fontSource.Parsed()
+	parsed, parsedErr := fontSource.ParsedErr()
+	if parsedErr != nil {
+		return GlyphMaskBatch{}, fmt.Errorf("glyph mask: %w", parsedErr)
+	}
 	hinting := selectGlyphMaskHinting(fontSize, matrix, isCJK, deviceScale)
 	useLCD := !aliased && e.lcdLayout != text.LCDLayoutNone && selectGlyphMaskLCD(fontSize, matrix)
 
@@ -727,8 +736,27 @@ func selectGlyphMaskLCD(_ float64, _ gg.Matrix) bool {
 	return false
 }
 
-// computeGlyphMaskFontID generates a stable hash identifier for a font source.
-// Delegates to text.ComputeFontID — single source of truth for font hashing.
+// computeGlyphMaskFontID generates a cache discriminator for a font source.
+//
+// FontID alone is stable across reloads (the same file yields the same ID), so
+// the source generation is folded in. Without this, a font hot-reloaded from
+// the same path would reuse atlas masks rasterized from the closed source's
+// released data. See text.FontSource.Generation.
 func computeGlyphMaskFontID(source *text.FontSource) uint64 {
-	return text.ComputeFontID(source)
+	return mixSourceGeneration(text.ComputeFontID(source), source.Generation())
+}
+
+// mixSourceGeneration combines a stable font ID with a FontSource generation
+// into a single key value. The generation is passed through a multiplicative
+// finalizer so adjacent generations spread across the key space instead of
+// producing neighbouring IDs. Generation 0 (no source) preserves the plain ID.
+func mixSourceGeneration(fontID, generation uint64) uint64 {
+	if generation == 0 {
+		return fontID
+	}
+	h := generation * 0x9E3779B97F4A7C15 // odd 64-bit golden-ratio constant
+	h ^= h >> 29
+	h *= 0xBF58476D1CE4E5B9
+	h ^= h >> 32
+	return fontID ^ h
 }
