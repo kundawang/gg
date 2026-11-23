@@ -389,8 +389,30 @@ func (e *OutlineExtractor) ExtractOutlineHintedVar(
 	}
 	// CFF1 has no gvar outline variation data. Keep the static CFF path (and
 	// its normal hinting fallback) authoritative when variation coordinates
-	// are supplied to the unified API.
+	// are supplied to the unified API. CFF2 carries its own variation model
+	// (blend against the VariationStore), so it gets a dedicated path.
 	if _, hasGlyf := ownFont.tables["glyf"]; !hasGlyf {
+		if _, hasCFF2 := ownFont.tables["CFF2"]; hasCFF2 {
+			var advance float64
+			if vap, ok := ParsedFont(ownFont).(VariableAdvanceProvider); ok {
+				advance = vap.GlyphAdvanceVar(uint16(gid), size, variations)
+			} else {
+				advance = ownFont.GlyphAdvance(uint16(gid), size)
+			}
+			outline, err := e.extractCFF2(ownFont, gid, size, advance, variations)
+			if err != nil {
+				return nil, err
+			}
+			if outline == nil || hinting == HintingNone {
+				return outline, nil
+			}
+			// CFF2 has no TT bytecode; use the same auto-hinter/grid-fit
+			// fallback chain as the static CFF path.
+			if !autoHintOutline(outline, parsedFont, size, hinting) {
+				gridFitOutline(outline, hinting)
+			}
+			return outline, nil
+		}
 		return e.ExtractOutlineHinted(parsedFont, gid, size, hinting)
 	}
 
@@ -648,7 +670,7 @@ func (e *OutlineExtractor) extractFromOwn(f *ownParsedFont, gid GlyphID, size fl
 	// Only dispatch to CFF when glyf is absent.
 	if _, hasGlyf := f.tables["glyf"]; !hasGlyf {
 		if _, hasCFF2 := f.tables["CFF2"]; hasCFF2 {
-			return nil, &FontError{Reason: "own parser: CFF2 outlines are unsupported"}
+			return e.extractCFF2(f, gid, size, advance, nil)
 		}
 		if _, hasCFF := f.tables["CFF "]; hasCFF {
 			return e.extractCFF(f, gid, size, advance)
@@ -733,6 +755,50 @@ func (e *OutlineExtractor) extractCFF(f *ownParsedFont, gid GlyphID, size, advan
 	}
 	if len(segments) != 0 {
 		out.Bounds = outlineSegmentBounds(segments)
+	}
+	return out, nil
+}
+
+// extractCFF2 extracts an outline from a CFF2 (variable OpenType) font.
+// The blend operator is evaluated against the variation coordinates derived
+// from variations (normalized via fvar, remapped via avar); a nil variations
+// slice yields the default instance. The advance always comes from hmtx/HVAR
+// via the caller — CFF2 charstrings carry no width. Every call decodes into
+// fresh segments, so repeated requests never share mutable output.
+func (e *OutlineExtractor) extractCFF2(f *ownParsedFont, gid GlyphID, size, advance float64, variations []FontVariation) (*GlyphOutline, error) {
+	cff2, err := f.loadCFF2()
+	if err != nil {
+		return nil, &FontError{Reason: fmt.Sprintf("own parser: CFF2 parse failed: %v", err)}
+	}
+	if cff2 == nil {
+		return nil, nil //nolint:nilnil // Lazy absence is represented as no drawable outline.
+	}
+	charstring, global, private, err := cff2.glyph(uint16(gid))
+	if err != nil {
+		return nil, &FontError{Reason: fmt.Sprintf("own parser: CFF2 glyph %d: %v", gid, err)}
+	}
+	var coords []int16
+	if len(variations) > 0 && cff2.vstore != nil {
+		f.loadFvar()
+		if len(f.fvarAxes) > 0 {
+			coords = normalizeCoords(f.fvarAxes, variations)
+			f.loadAvar()
+			f.avar.apply(coords)
+		}
+	}
+	segments, err := decodeCFF2Charstring(charstring, private.localSubrs, global, cff2.blendContext(coords))
+	if err != nil {
+		return nil, &FontError{Reason: fmt.Sprintf("own parser: CFF2 glyph %d: %v", gid, err)}
+	}
+	scale := size / float64(f.upem)
+	scaled := scaleCFFSegments(segments, scale)
+	out := &GlyphOutline{Segments: scaled, GID: gid, Type: GlyphTypeOutline, Advance: float32(advance)}
+	f.ensureHmtx()
+	if f.hmtxParsed && int(gid) < len(f.hmtxLSB) {
+		out.LSB = float32(float64(f.hmtxLSB[gid]) * scale)
+	}
+	if len(scaled) != 0 {
+		out.Bounds = outlineSegmentBounds(scaled)
 	}
 	return out, nil
 }

@@ -123,6 +123,13 @@ type ownParsedFont struct {
 	cffOnce sync.Once
 	cff     *cffFont
 	cffErr  error
+
+	// CFF2 outlines (variable OpenType fonts) — same lazy, deterministic
+	// contract as CFF1. The parsed table is immutable; variation-dependent
+	// blend output is computed per request and never shared.
+	cff2Once sync.Once
+	cff2     *cff2Font
+	cff2Err  error
 }
 
 // --- ParsedFont interface ---
@@ -229,23 +236,44 @@ func (f *ownParsedFont) GlyphBounds(glyphIndex uint16, ppem float64) Rect {
 }
 
 func (f *ownParsedFont) cffGlyphBounds(glyphIndex uint16, ppem float64) Rect {
-	if f.upem == 0 || f.tables["CFF "] == nil {
+	if f.upem == 0 {
 		return Rect{}
 	}
-	cff, err := f.loadCFF()
-	if err != nil || cff == nil {
-		return Rect{}
+	if f.tables["CFF "] != nil {
+		cff, err := f.loadCFF()
+		if err != nil || cff == nil {
+			return Rect{}
+		}
+		charstring, global, private, err := cff.glyph(glyphIndex)
+		if err != nil {
+			return Rect{}
+		}
+		decoded, err := decodeType2(charstring, private.localSubrs, global, private.nominalWidth)
+		if err != nil || len(decoded.segments) == 0 {
+			return Rect{}
+		}
+		segments := scaleCFFSegments(decoded.segments, ppem/float64(f.upem))
+		return outlineSegmentBounds(segments)
 	}
-	charstring, global, private, err := cff.glyph(glyphIndex)
-	if err != nil {
-		return Rect{}
+	if f.tables["CFF2"] != nil {
+		// Bounds have no variation-coordinate input (matching glyf, which
+		// reports unvaried header bounds), so decode the default instance.
+		cff2, err := f.loadCFF2()
+		if err != nil || cff2 == nil {
+			return Rect{}
+		}
+		charstring, global, private, err := cff2.glyph(glyphIndex)
+		if err != nil {
+			return Rect{}
+		}
+		decoded, err := decodeCFF2Charstring(charstring, private.localSubrs, global, cff2.blendContext(nil))
+		if err != nil || len(decoded) == 0 {
+			return Rect{}
+		}
+		segments := scaleCFFSegments(decoded, ppem/float64(f.upem))
+		return outlineSegmentBounds(segments)
 	}
-	decoded, err := decodeType2(charstring, private.localSubrs, global, private.nominalWidth)
-	if err != nil || len(decoded.segments) == 0 {
-		return Rect{}
-	}
-	segments := scaleCFFSegments(decoded.segments, ppem/float64(f.upem))
-	return outlineSegmentBounds(segments)
+	return Rect{}
 }
 
 func (f *ownParsedFont) loadCFF() (*cffFont, error) {
@@ -262,6 +290,24 @@ func (f *ownParsedFont) loadCFF() (*cffFont, error) {
 		}
 	})
 	return f.cff, f.cffErr
+}
+
+// loadCFF2 lazily parses the CFF2 table with the same determinism contract
+// as loadCFF: the parse result (or error) is computed once and shared.
+func (f *ownParsedFont) loadCFF2() (*cff2Font, error) {
+	f.cff2Once.Do(func() {
+		data, ok := f.tables["CFF2"]
+		if !ok {
+			return
+		}
+		f.cff2, f.cff2Err = parseCFF2(data)
+		if f.cff2Err == nil && len(f.cff2.charStrings) != f.numGlyphs {
+			charStringCount := len(f.cff2.charStrings)
+			f.cff2 = nil
+			f.cff2Err = fmt.Errorf("text: CFF2: CharStrings count %d does not match maxp glyph count %d", charStringCount, f.numGlyphs)
+		}
+	})
+	return f.cff2, f.cff2Err
 }
 
 // Metrics implements ParsedFont.Metrics.
