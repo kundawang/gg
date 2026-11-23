@@ -1,0 +1,162 @@
+[
+  {
+    "name": "clear_opaque",
+    "w": 24,
+    "h": 20,
+    "min_x": 0,
+    "min_y": 0,
+    "snapshot": true
+  },
+  {
+    "name": "clear_translucent",
+    "w": 16,
+    "h": 16,
+    "min_x": 0,
+    "min_y": 0,
+    "snapshot": true
+  },
+  {
+    "name": "fill_rect_overlap",
+    "w": 32,
+    "h": 24,
+    "min_x": 0,
+    "min_y": 0,
+    "snapshot": true
+  },
+  {
+    "name": "fill_circle_curve",
+    "w": 28,
+    "h": 28,
+    "min_x": 0,
+    "min_y": 0,
+    "snapshot": false
+  },
+  {
+    "name": "fill_evenodd",
+    "w": 40,
+    "h": 40,
+    "min_x": 0,
+    "min_y": 0,
+    "snapshot": false
+  },
+  {
+    "name": "fill_partly_outside",
+    "w": 20,
+    "h": 20,
+    "min_x": 0,
+    "min_y": 0,
+    "snapshot": false
+  },
+  {
+    "name": "stroke_line_overlap",
+    "w": 40,
+    "h": 30,
+    "min_x": 0,
+    "min_y": 0,
+    "snapshot": false
+  },
+  {
+    "name": "stroke_quad_curve",
+    "w": 40,
+    "h": 30,
+    "min_x": 0,
+    "min_y": 0,
+    "snapshot": false
+  },
+  {
+    "name": "stroke_cubic_curve",
+    "w": 40,
+    "h": 30,
+    "min_x": 0,
+    "min_y": 0,
+    "snapshot": false
+  },
+  {
+    "name": "drawimage_rgba_transparent_edges",
+    "w": 32,
+    "h": 24,
+    "min_x": 0,
+    "min_y": 0,
+    "snapshot": true
+  },
+  {
+    "name": "drawimage_nrgba",
+    "w": 24,
+    "h": 20,
+    "min_x": 0,
+    "min_y": 0,
+    "snapshot": false
+  },
+  {
+    "name": "drawimage_alpha_half",
+    "w": 24,
+    "h": 20,
+    "min_x": 0,
+    "min_y": 0,
+    "snapshot": false
+  },
+  {
+    "name": "drawimage_srcrect",
+    "w": 24,
+    "h": 20,
+    "min_x": 0,
+    "min_y": 0,
+    "snapshot": false
+  },
+  {
+    "name": "drawimage_out_of_bounds",
+    "w": 12,
+    "h": 12,
+    "min_x": 0,
+    "min_y": 0,
+    "snapshot": false
+  },
+  {
+    "name": "drawimage_generic_gray",
+    "w": 16,
+    "h": 16,
+    "min_x": 0,
+    "min_y": 0,
+    "snapshot": false
+  },
+  {
+    "name": "drawimage_empty_and_negative_srcrect",
+    "w": 12,
+    "h": 12,
+    "min_x": 0,
+    "min_y": 0,
+    "snapshot": false
+  },
+  {
+    "name": "fromimage_nonzero_origin",
+    "w": 24,
+    "h": 20,
+    "min_x": 5,
+    "min_y": 7,
+    "snapshot": false
+  },
+  {
+    "name": "fromimage_nonzero_origin_blank",
+    "w": 12,
+    "h": 9,
+    "min_x": 8,
+    "min_y": 3,
+    "snapshot": false
+  },
+  {
+    "name": "fromimage_custom_stride",
+    "w": 10,
+    "h": 8,
+    "min_x": 0,
+    "min_y": 0,
+    "snapshot": false
+  },
+  {
+    "name": "negative_size_clamped",
+    "w": 1,
+    "h": 1,
+    "min_x": 0,
+    "min_y": 0,
+    "snapshot": false
+  }
+]
