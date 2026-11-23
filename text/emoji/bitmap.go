@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"image"
 	"image/png"
 )
@@ -97,16 +98,24 @@ type BitmapGlyph struct {
 }
 
 // Decode decodes the bitmap data to an image.Image.
-// Currently only supports PNG format.
-// Returns nil if the format is not supported or data is invalid.
+// Supports PNG and JPEG formats.
+// JPEG bitmaps are decoded to an opaque *image.NRGBA (JPEG has no alpha),
+// with EXIF orientation applied and bounds starting at (0,0).
+// Returns an error if the format is not supported or data is invalid.
 func (b *BitmapGlyph) Decode() (image.Image, error) {
 	switch b.Format {
 	case FormatPNG:
-		return png.Decode(bytes.NewReader(b.Data))
+		img, err := png.Decode(bytes.NewReader(b.Data))
+		if err != nil {
+			return nil, fmt.Errorf("emoji: decode PNG bitmap glyph %d: %w", b.GlyphID, err)
+		}
+		return img, nil
 	case FormatJPEG:
-		// JPEG support would require image/jpeg import
-		// For now, return an error indicating it's not yet implemented
-		return nil, errors.New("emoji: JPEG bitmap decoding not yet implemented")
+		img, err := decodeJPEGBitmap(b.Data)
+		if err != nil {
+			return nil, fmt.Errorf("emoji: decode JPEG bitmap glyph %d: %w", b.GlyphID, err)
+		}
+		return img, nil
 	default:
 		return nil, ErrUnsupportedBitmapFormat
 	}
@@ -296,12 +305,20 @@ func (p *SBIXParser) GetGlyph(glyphID, strikeIndex int) (*BitmapGlyph, error) {
 		PPEM:    strike.ppem,
 	}
 
-	// Try to decode PNG to get dimensions
-	if format == FormatPNG && len(imageData) > 0 {
-		if img, decodeErr := png.Decode(bytes.NewReader(imageData)); decodeErr == nil {
-			bounds := img.Bounds()
-			bitmap.Width = bounds.Dx()
-			bitmap.Height = bounds.Dy()
+	// Try to decode image dimensions for the bitmap metadata.
+	if len(imageData) > 0 {
+		switch format {
+		case FormatPNG:
+			if img, decodeErr := png.Decode(bytes.NewReader(imageData)); decodeErr == nil {
+				bounds := img.Bounds()
+				bitmap.Width = bounds.Dx()
+				bitmap.Height = bounds.Dy()
+			}
+		case FormatJPEG:
+			if w, h, dimErr := jpegBitmapDimensions(imageData); dimErr == nil {
+				bitmap.Width = w
+				bitmap.Height = h
+			}
 		}
 	}
 

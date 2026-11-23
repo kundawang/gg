@@ -81,8 +81,13 @@ func drawBitmapGlyph(dst draw.Image, colorFont ColorFont, glyphID uint16, ppem u
 	}
 
 	// Calculate scaling factor.
-	scale := float64(ppem) / float64(bitmap.PPEM)
-	if scale == 0 {
+	// A zero PPEM in the font's bitmap metadata is invalid; fall back to
+	// unscaled drawing rather than dividing by zero.
+	scale := 1.0
+	if bitmap.PPEM != 0 {
+		scale = float64(ppem) / float64(bitmap.PPEM)
+	}
+	if scale <= 0 {
 		scale = 1.0
 	}
 

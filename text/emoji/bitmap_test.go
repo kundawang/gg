@@ -40,15 +40,15 @@ func TestBitmapGlyph_Decode_UnsupportedFormat(t *testing.T) {
 	}
 }
 
-func TestBitmapGlyph_Decode_JPEG(t *testing.T) {
+func TestBitmapGlyph_Decode_JPEG_InvalidData(t *testing.T) {
 	glyph := &BitmapGlyph{
 		Format: FormatJPEG,
 		Data:   []byte{0, 1, 2, 3},
 	}
 
 	_, err := glyph.Decode()
-	if err == nil {
-		t.Error("Decode() should return error for JPEG (not implemented)")
+	if !errors.Is(err, ErrInvalidJPEGData) {
+		t.Errorf("Decode() error = %v, want ErrInvalidJPEGData", err)
 	}
 }
 
