@@ -69,10 +69,11 @@ type Backend struct {
 
 // Ensure Backend implements all required interfaces.
 var (
-	_ recording.Backend       = (*Backend)(nil)
-	_ recording.WriterBackend = (*Backend)(nil)
-	_ recording.FileBackend   = (*Backend)(nil)
-	_ recording.PixmapBackend = (*Backend)(nil)
+	_ recording.Backend          = (*Backend)(nil)
+	_ recording.WriterBackend    = (*Backend)(nil)
+	_ recording.FileBackend      = (*Backend)(nil)
+	_ recording.PixmapBackend    = (*Backend)(nil)
+	_ recording.RRectClipBackend = (*Backend)(nil)
 )
 
 // NewBackend creates a new raster backend.
@@ -137,6 +138,18 @@ func (b *Backend) SetClip(path *gg.Path, rule recording.FillRule) {
 // ClearClip removes any clipping region.
 func (b *Backend) ClearClip() {
 	b.ctx.ResetClip()
+}
+
+// ClipRoundRect intersects the current clip with the rounded rectangle given
+// in the current user coordinate space. Playback keeps the transform that was
+// active at record time installed, so delegating to gg.Context.ClipRoundRect
+// reproduces the exact user-space geometry, device-space SDF/mask sampling and
+// clip Bounds of a direct Context call under any affine transform — including
+// rotation, shear, non-uniform and negative scale. The current transform is
+// left untouched for subsequent commands; clip state itself is owned by the
+// context's Save/Restore stack.
+func (b *Backend) ClipRoundRect(x, y, w, h, radius float64) {
+	b.ctx.ClipRoundRect(x, y, w, h, radius)
 }
 
 // FillPath fills the given path with the brush.

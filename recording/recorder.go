@@ -165,23 +165,22 @@ func (r *Recording) Playback(backend Backend) error {
 		case ClearClipCommand:
 			backend.ClearClip()
 		case ClipRoundRectCommand:
-			// Convert RRect clip to a path for backends that don't
-			// natively support rounded rectangle clipping. Match Context's
-			// ClipRoundRect transform semantics: transform the two diagonal
-			// corners into an axis-aligned box and scale the corner radius.
-			x1, y1 := transform.TransformPoint(c.X, c.Y)
-			x2, y2 := transform.TransformPoint(c.X+c.W, c.Y+c.H)
-			x := math.Min(x1, x2)
-			y := math.Min(y1, y2)
-			w := math.Abs(x2 - x1)
-			h := math.Abs(y2 - y1)
-			radius := 0.0
-			if c.Radius > 0 {
-				radius = c.Radius * transform.ScaleFactor()
-				radius = math.Min(radius, math.Min(w, h)/2)
+			// Prefer a backend that applies the user-space rounded rect with
+			// the current transform itself. Sharing gg.Context.ClipRoundRect
+			// keeps the SDF/rasterized coverage and Bounds identical to a
+			// direct draw under scale, rotation, shear and reflection.
+			if rr, ok := backend.(RRectClipBackend); ok {
+				rr.ClipRoundRect(c.X, c.Y, c.W, c.H, c.Radius)
+				continue
 			}
-			rrPath := gg.BuildPath().RoundRect(x, y, w, h, radius).Build()
-			setPlaybackClip(backend, rrPath, FillRuleNonZero, transform)
+			// Generic fallback: reproduce Context.ClipRoundRect geometry in
+			// user space and transform it to device space as a single path.
+			// The old two-corner bounding box collapsed rotated/sheared shapes
+			// and let transformed fills leak outside the real clip.
+			rrPath := transformedClipRoundRect(c, transform)
+			if rrPath != nil {
+				setPlaybackClip(backend, rrPath, FillRuleNonZero, transform)
+			}
 		case FillPathCommand:
 			path := r.resources.GetPath(c.Path)
 			brush := r.resources.GetBrush(c.Brush)

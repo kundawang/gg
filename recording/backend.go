@@ -94,6 +94,22 @@ type Backend interface {
 	DrawText(s string, x, y float64, face text.Face, brush Brush)
 }
 
+// RRectClipBackend is an optional extension of Backend for backends that can
+// apply a user-space rounded-rectangle clip while honoring the current
+// transform themselves. Playback invokes ClipRoundRect with the transform that
+// was current when the clip was recorded still installed, so the backend can
+// reuse the exact same user-space geometry and device-space sampling as a
+// direct context call (for example gg.Context.ClipRoundRect). Backends that do
+// not implement this interface receive a transformed path through SetClip
+// instead, which preserves the same geometry for any affine transform.
+type RRectClipBackend interface {
+	Backend
+
+	// ClipRoundRect intersects the current clip with the rounded rectangle
+	// (x, y, w, h, radius) expressed in the current user coordinate space.
+	ClipRoundRect(x, y, w, h, radius float64)
+}
+
 // WriterBackend extends Backend with the ability to write output to an io.Writer.
 // This is useful for streaming output or writing to network connections.
 type WriterBackend interface {
