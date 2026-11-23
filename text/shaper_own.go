@@ -441,9 +441,10 @@ func buildShapedGlyphs(
 		xOff := float64(adj.xPlacement) * scale
 		yOff := float64(adj.yPlacement) * scale
 
-		var cjk bool
+		var cjk, space bool
 		if ge.cluster < len(runes) {
 			cjk = IsCJKRune(runes[ge.cluster])
+			space = isWordSpaceRune(runes[ge.cluster])
 		}
 
 		result[i] = ShapedGlyph{
@@ -454,6 +455,7 @@ func buildShapedGlyphs(
 			XAdvance: xAdv,
 			YAdvance: yAdv,
 			IsCJK:    cjk,
+			IsSpace:  space,
 		}
 
 		x += xAdv

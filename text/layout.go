@@ -2,6 +2,7 @@ package text
 
 import (
 	"context"
+	"math"
 	"strings"
 	"unicode"
 )
@@ -16,7 +17,9 @@ const (
 	AlignCenter
 	// AlignRight aligns text to the right edge.
 	AlignRight
-	// AlignJustify distributes text evenly (future implementation).
+	// AlignJustify distributes extra width across word spaces and CJK
+	// gaps so that every non-final line of a paragraph spans MaxWidth.
+	// The final line of each paragraph uses JustifyOptions.LastLineAlignment.
 	AlignJustify
 )
 
@@ -34,6 +37,35 @@ func (a Alignment) String() string {
 	default:
 		return unknownStr
 	}
+}
+
+// defaultCJKGapWeight is the expansion weight of inter-CJK gaps used when
+// JustifyOptions.CJKGapWeight is zero.
+const defaultCJKGapWeight = 1.0
+
+// JustifyOptions configures justified alignment (AlignJustify).
+// The zero value is valid and uses the documented defaults.
+type JustifyOptions struct {
+	// MaxWordSpacing caps the total width of an expanded word space at
+	// this multiple of its original advance (e.g. 2.5 allows a space to
+	// grow to 250% of its natural width). Extra width that cannot be
+	// placed within the cap flows to uncapped expansion points (CJK gaps);
+	// if none remain, the line keeps a smaller final width.
+	// Values <= 0 (the default) mean no cap.
+	MaxWordSpacing float64
+
+	// CJKGapWeight is the expansion weight of gaps between two adjacent
+	// CJK glyphs, relative to a word space (weight 1.0).
+	// Zero selects the default (1.0); a negative value disables CJK gap
+	// expansion entirely.
+	CJKGapWeight float64
+
+	// LastLineAlignment is applied to the final line of each paragraph
+	// (the line before a hard break, or the only line of an unwrapped
+	// paragraph). The zero value (AlignLeft) is the common choice.
+	// AlignJustify here is treated as AlignLeft: final lines are never
+	// stretched.
+	LastLineAlignment Alignment
 }
 
 // LayoutOptions configures text layout behavior.
@@ -57,6 +89,10 @@ type LayoutOptions struct {
 	// Default is WrapWordChar which breaks at word boundaries first,
 	// then falls back to character boundaries for long words.
 	WrapMode WrapMode
+
+	// Justify configures AlignJustify behavior (word-spacing cap,
+	// CJK gap weight, last-line policy). Ignored for other alignments.
+	Justify JustifyOptions
 }
 
 // DefaultLayoutOptions returns sensible default layout options.
@@ -193,8 +229,10 @@ func LayoutTextWithContext(ctx context.Context, text string, face Face, opts Lay
 
 			line.Y = y
 
-			// Apply horizontal alignment
-			applyAlignment(line, opts.Alignment, opts.MaxWidth)
+			// Apply horizontal alignment. The last line of each paragraph
+			// (before a hard break) follows the last-line policy.
+			isLastLine := j == len(paraLines)-1
+			applyAlignment(line, opts.Alignment, opts.MaxWidth, opts.Justify, isLastLine)
 
 			// Track layout bounds
 			if line.Width > layout.Width {
@@ -509,8 +547,25 @@ func createLineFromGlyphs(infos []glyphInfo, runs []ShapedRun, startX float64, m
 }
 
 // applyAlignment adjusts glyph X positions based on alignment.
-func applyAlignment(line *Line, alignment Alignment, maxWidth float64) {
+// isLastLine reports whether the line is the final line of its paragraph
+// (relevant only for AlignJustify).
+func applyAlignment(line *Line, alignment Alignment, maxWidth float64, justify JustifyOptions, isLastLine bool) {
 	if len(line.Glyphs) == 0 {
+		return
+	}
+
+	if alignment == AlignJustify {
+		if isLastLine {
+			// Final line of a paragraph: apply the configured policy.
+			// AlignJustify here would stretch the last line; treat as left.
+			last := justify.LastLineAlignment
+			if last == AlignJustify {
+				last = AlignLeft
+			}
+			applyAlignment(line, last, maxWidth, justify, false)
+			return
+		}
+		justifyLine(line, maxWidth, justify)
 		return
 	}
 
@@ -532,10 +587,6 @@ func applyAlignment(line *Line, alignment Alignment, maxWidth float64) {
 			containerWidth = line.Width
 		}
 		offset = containerWidth - line.Width
-	case AlignJustify:
-		// Justify: distribute extra space between words
-		// For now, treat as left-aligned (future implementation)
-		return
 	}
 
 	if offset <= 0 {
@@ -555,9 +606,171 @@ func applyAlignment(line *Line, alignment Alignment, maxWidth float64) {
 	}
 }
 
+// expansionPoint is a gap after a glyph where justification may add width.
+type expansionPoint struct {
+	// afterGlyph is the index of the glyph preceding the gap.
+	afterGlyph int
+	// weight is the relative share of extra width this gap receives.
+	weight float64
+	// maxExtra caps the extra width added at this gap (math.Inf(1) if uncapped).
+	maxExtra float64
+}
+
+// justifyLine distributes extra width across a line's expansion points so
+// the line spans maxWidth. Expansion points are gaps after word-space
+// glyphs (weight 1, optionally capped) and gaps between adjacent CJK
+// glyphs (weight JustifyOptions.CJKGapWeight). Gaps inside a cluster
+// (ligatures, contextual forms) are never expanded.
+//
+// The function is deterministic and total: it never leaks width into
+// other lines, and leaves the line unchanged when justification is
+// impossible or undefined (no expansion points, non-positive or
+// non-finite maxWidth, or a line already wider than maxWidth).
+func justifyLine(line *Line, maxWidth float64, opts JustifyOptions) {
+	if len(line.Glyphs) < 2 {
+		return
+	}
+	if maxWidth <= 0 || math.IsNaN(maxWidth) || math.IsInf(maxWidth, 0) {
+		return
+	}
+	extra := maxWidth - line.Width
+	if extra <= 0 {
+		return
+	}
+
+	cjkWeight := opts.CJKGapWeight
+	switch {
+	case cjkWeight == 0:
+		cjkWeight = defaultCJKGapWeight
+	case cjkWeight < 0:
+		cjkWeight = 0
+	}
+
+	// Collect expansion points between adjacent glyphs (visual order).
+	glyphs := line.Glyphs
+	points := make([]expansionPoint, 0, len(glyphs)/2)
+	for i := 0; i+1 < len(glyphs); i++ {
+		// Never split a cluster: glyphs sharing a cluster index
+		// (ligatures, Arabic contextual forms) move as a unit.
+		if glyphs[i].Cluster == glyphs[i+1].Cluster {
+			continue
+		}
+		switch {
+		case glyphs[i].IsSpace:
+			maxExtra := math.Inf(1)
+			if opts.MaxWordSpacing > 0 {
+				adv := glyphs[i].XAdvance
+				if adv < 0 {
+					adv = 0
+				}
+				maxExtra = (opts.MaxWordSpacing - 1) * adv
+				if maxExtra < 0 {
+					maxExtra = 0
+				}
+			}
+			points = append(points, expansionPoint{afterGlyph: i, weight: 1, maxExtra: maxExtra})
+		case cjkWeight > 0 && glyphs[i].IsCJK && glyphs[i+1].IsCJK:
+			points = append(points, expansionPoint{afterGlyph: i, weight: cjkWeight, maxExtra: math.Inf(1)})
+		}
+	}
+	if len(points) == 0 {
+		return
+	}
+
+	// Distribute `extra` proportionally to weights, respecting per-point
+	// caps (water-filling: capped points are saturated and the remainder
+	// is redistributed among the rest).
+	extras := make([]float64, len(points))
+	active := make([]bool, len(points))
+	for i := range active {
+		active[i] = true
+	}
+	remaining := extra
+	for remaining > 1e-9 {
+		var totalWeight float64
+		for k := range points {
+			if active[k] {
+				totalWeight += points[k].weight
+			}
+		}
+		if totalWeight <= 0 {
+			break
+		}
+		saturated := false
+		for k := range points {
+			if !active[k] {
+				continue
+			}
+			share := remaining * points[k].weight / totalWeight
+			if extras[k]+share >= points[k].maxExtra {
+				remaining -= points[k].maxExtra - extras[k]
+				extras[k] = points[k].maxExtra
+				active[k] = false
+				saturated = true
+			}
+		}
+		if !saturated {
+			// No point hits its cap: distribute everything and finish.
+			for k := range points {
+				if active[k] {
+					extras[k] += remaining * points[k].weight / totalWeight
+				}
+			}
+			remaining = 0
+		}
+	}
+	distributed := extra - remaining
+	if distributed <= 0 {
+		return
+	}
+
+	// Accumulate per-gap extras into per-glyph shifts, then apply.
+	gapExtra := make([]float64, len(glyphs)-1)
+	for k, p := range points {
+		gapExtra[p.afterGlyph] = extras[k]
+	}
+	shifts := make([]float64, len(glyphs))
+	var acc float64
+	for i := 1; i < len(glyphs); i++ {
+		acc += gapExtra[i-1]
+		shifts[i] = acc
+	}
+	for i := range glyphs {
+		glyphs[i].X += shifts[i]
+	}
+
+	// Apply the same shifts to run glyphs. Runs partition the line's
+	// glyphs in order, so a running index maps each run glyph to its
+	// shift; run advances are then recomputed from positions.
+	gi := 0
+	for i := range line.Runs {
+		run := &line.Runs[i]
+		for j := range run.Glyphs {
+			if gi < len(shifts) {
+				run.Glyphs[j].X += shifts[gi]
+			}
+			gi++
+		}
+		if len(run.Glyphs) > 0 {
+			firstG := &run.Glyphs[0]
+			lastG := &run.Glyphs[len(run.Glyphs)-1]
+			run.Advance = lastG.X - firstG.X + lastG.XAdvance
+		}
+	}
+
+	line.Width += distributed
+}
+
 // isWordBreakRune returns true if the rune is a word break opportunity.
 func isWordBreakRune(r rune) bool {
 	return unicode.IsSpace(r) || isCJK(r)
+}
+
+// isWordSpaceRune returns true if the rune is a Unicode space separator
+// (category Zs: U+0020, U+00A0, U+2000–U+200A, …). Such runes mark
+// expandable word-space gaps for justified alignment.
+func isWordSpaceRune(r rune) bool {
+	return unicode.Is(unicode.Zs, r)
 }
 
 // isCJK returns true if the rune is a CJK character.

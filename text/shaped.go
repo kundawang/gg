@@ -16,6 +16,11 @@ type ShapedGlyph struct {
 	// reduced hinting and bypass bucket quantization (ADR-027).
 	IsCJK bool
 
+	// IsSpace indicates that this glyph represents a Unicode space
+	// separator (category Zs, e.g. U+0020, U+00A0). Used by justified
+	// alignment to locate expandable word-space gaps.
+	IsSpace bool
+
 	// X is the horizontal position relative to the text origin.
 	X float64
 
