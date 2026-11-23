@@ -27,4 +27,10 @@ type ShapedGlyph struct {
 
 	// YAdvance is the vertical advance (for vertical text).
 	YAdvance float64
+
+	// VerticalOrient is the orientation assigned by vertical layout.
+	// The zero value is VerticalOrientUpright, which is also the correct
+	// value for every horizontal-layout glyph, so existing constructions
+	// remain valid. Ignored by horizontal layout and rendering.
+	VerticalOrient VerticalOrient
 }

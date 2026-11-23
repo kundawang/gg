@@ -48,6 +48,13 @@ Bidi/Script  Cache    Lines    ┌────┴────┐
 - **CJK support** — Break opportunities at ideograph boundaries
 - **Performance** — 1,185 ns/op FindBreakOpportunities, 0 allocs
 
+### Vertical Layout (TTB / BTT)
+- **Column layout** — Top-to-bottom and bottom-to-top columns with absolute glyph coordinates
+- **vhea/vmtx metrics** — Native vertical advances/origins, em-square synthesis fallback
+- **Orientation rules** — Per-class (Latin, CJK, punctuation, marks, emoji) upright/sideways policy
+- **Sideways rotation** — 90° clockwise run rotation in `DrawLayout`
+- **Column wrapping** — MaxWidth reused as column height; hard breaks start new columns
+
 ### Shaping Cache (v0.10.0)
 - **16-shard LRU** — Concurrent access without lock contention
 - **4K total entries** — 256 per shard
@@ -148,6 +155,59 @@ for _, r := range results {
 // Measure text width
 width := text.MeasureText("Hello World", face)
 ```
+
+### Vertical Layout (TTB / BTT)
+
+Vertical layout lays text out in columns along a vertical baseline, for
+vertical titles and East Asian annotations. Enable it by combining a
+vertical `Direction` with `Vertical` options; horizontal behavior is
+unchanged when `Vertical` is nil.
+
+```go
+// Top-to-bottom columns (default flow: right-to-left, CSS "mixed" rules:
+// CJK upright, Latin sideways).
+opts := text.LayoutOptions{
+    Direction: text.DirectionTTB,
+    Vertical:  &text.VerticalOptions{},
+}
+layout := text.LayoutText("标题 title", face, opts)
+
+// Columns replace lines; every glyph carries an absolute position and its
+// resolved orientation (Upright or Sideways).
+for _, col := range layout.Columns {
+    fmt.Printf("X=%.1f Width=%.1f Height=%.1f Glyphs=%d\n",
+        col.X, col.Width, col.Height, len(col.Glyphs))
+    for _, g := range col.Glyphs {
+        fmt.Printf("  X=%.1f Y=%.1f orient=%s cluster=%d\n",
+            g.X, g.Y, g.VerticalOrient, g.Cluster)
+    }
+}
+
+// Bottom-to-top (columns progress left-to-right by default).
+opts.Direction = text.DirectionBTT
+
+// Global sideways policy (CSS text-orientation: sideways), per-class
+// overrides, explicit column flow and extra column spacing.
+opts.Vertical = &text.VerticalOptions{
+    Orientation:   text.VerticalOrientSideways,
+    Flow:          text.ColumnFlowLeftToRight,
+    ColumnSpacing: 8,
+    ClassModes: map[text.VerticalClass]text.VerticalOrient{
+        text.VerticalClassLatin: text.VerticalOrientUpright,
+    },
+}
+
+// MaxWidth doubles as the maximum column height; NaN/Inf and <= 0 disable
+// column wrapping. DrawLayout rasterizes columns, rotating sideways runs
+// 90° clockwise around the column center line.
+text.DrawLayout(dst, layout, face, x, y, color.Black)
+```
+
+Vertical metrics come from the font's vhea/vmtx tables when present; fonts
+without them get synthesized em-square metrics (one-em advance, centered
+vertical origin). Orientation is resolved per rune class (Latin, CJK,
+punctuation, combining marks, emoji), with marks inheriting their base
+glyph's orientation.
 
 ### OwnShaper (default, GSUB/GPOS)
 

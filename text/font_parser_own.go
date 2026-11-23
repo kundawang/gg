@@ -87,6 +87,15 @@ type ownParsedFont struct {
 	numHMetrics int      // from hhea.numberOfHMetrics
 	hmtxParsed  bool     // true if hmtx was parsed successfully
 
+	// Vertical metrics (vhea/vmtx) — lazily parsed. vmtxParsed is false for
+	// fonts without vertical tables; callers then synthesize em-square metrics.
+	vmtxOnce    sync.Once
+	vmtxAdv     []int16 // advance heights from vmtx
+	vmtxTSB     []int16 // top side bearings from vmtx
+	numVMetrics int     // from vhea.numberOfLongVerMetrics
+	vhea        vheaMetrics
+	vmtxParsed  bool
+
 	nameOnce   sync.Once
 	familyName string
 	fullName   string
@@ -164,6 +173,81 @@ func (f *ownParsedFont) GlyphAdvance(glyphIndex uint16, ppem float64) float64 {
 	}
 	advFU := hmtxAdvance(f.hmtxAdv, f.numHMetrics, glyphIndex)
 	return float64(advFU) * ppem / float64(f.upem)
+}
+
+// --- VerticalMetricProvider ---
+
+// HasVerticalMetrics reports whether the font ships vhea/vmtx tables.
+// When false, vertical layout synthesizes em-square metrics.
+func (f *ownParsedFont) HasVerticalMetrics() bool {
+	f.ensureVmtx()
+	return f.vmtxParsed
+}
+
+// VerticalAdvance returns the vertical advance height in pixels for the
+// glyph. See VerticalMetricProvider.
+func (f *ownParsedFont) VerticalAdvance(glyphIndex uint16, ppem float64) float64 {
+	f.ensureVmtx()
+	if f.upem == 0 {
+		return 0
+	}
+	scale := ppem / float64(f.upem)
+	if !f.vmtxParsed {
+		// Synthesized fallback: every glyph advances one em square.
+		return ppem
+	}
+	return float64(vmtxAdvance(f.vmtxAdv, f.numVMetrics, glyphIndex)) * scale
+}
+
+// VerticalOrigin returns the vertical origin of the glyph relative to the
+// horizontal origin (glyph baseline, Y-down pixel convention), in pixels.
+//
+// For fonts with vmtx the Y coordinate derives from the glyph's top side
+// bearing and bounding box; without vmtx the origin is synthesized at the
+// vertical center of the em square (x = hAdvance/2, y = -em/2).
+// See VerticalMetricProvider.
+func (f *ownParsedFont) VerticalOrigin(glyphIndex uint16, ppem float64) (x, y float64) {
+	if f.upem == 0 {
+		return 0, 0
+	}
+	scale := ppem / float64(f.upem)
+	hAdvance := f.GlyphAdvance(glyphIndex, ppem)
+
+	f.ensureVmtx()
+	if !f.vmtxParsed {
+		// Synthesized vertical origin: centered horizontally on the em
+		// square, one half-em above the baseline in Y-up coordinates.
+		// In Y-down pixel space "above" is negative.
+		return hAdvance / 2, -ppem / 2
+	}
+
+	// Y-up font units: verticalOriginY = yMax + topSideBearing.
+	bounds := f.GlyphBounds(glyphIndex, ppem)
+	// GlyphBounds is Y-down; the top edge is MinY (negative above baseline).
+	// Convert back to Y-up: yMaxPx = -MinY.
+	yMaxUp := -bounds.MinY
+	var tsbPx float64
+	if int(glyphIndex) < len(f.vmtxTSB) {
+		tsbPx = float64(f.vmtxTSB[glyphIndex]) * scale
+	}
+	originYUp := yMaxUp + tsbPx
+	// Convert Y-up origin to Y-down offset.
+	return hAdvance / 2, -originYUp
+}
+
+// VerticalLineGap returns the recommended extra gap between vertical
+// columns in pixels. Derived from vhea.vertTypoLineGap; zero when the font
+// has no vertical tables.
+func (f *ownParsedFont) VerticalLineGap(ppem float64) float64 {
+	f.ensureVmtx()
+	if !f.vmtxParsed || f.upem == 0 {
+		return 0
+	}
+	v := f.vhea.vertTypoLineGap
+	if v < 0 {
+		v = 0
+	}
+	return float64(v) * ppem / float64(f.upem)
 }
 
 // GlyphBounds implements ParsedFont.GlyphBounds.
@@ -353,6 +437,35 @@ func (f *ownParsedFont) ensureHmtx() {
 		f.hmtxLSB = lsbs
 		f.numHMetrics = hhea.numberOfHMetrics
 		f.hmtxParsed = true
+	})
+}
+
+// ensureVmtx lazily parses the vhea and vmtx tables for vertical metrics.
+// Fonts without either table leave vmtxParsed false; callers synthesize
+// em-square fallback metrics in that case.
+func (f *ownParsedFont) ensureVmtx() {
+	f.vmtxOnce.Do(func() {
+		vheaData, ok := f.tables["vhea"]
+		if !ok {
+			return
+		}
+		vhea, ok := parseVheaTable(vheaData)
+		if !ok || vhea.numberOfVMetrics == 0 {
+			return
+		}
+		vmtxData, ok := f.tables["vmtx"]
+		if !ok {
+			return
+		}
+		advances, tsbs, ok := parseVmtx(vmtxData, vhea.numberOfVMetrics, f.numGlyphs)
+		if !ok {
+			return
+		}
+		f.vhea = vhea
+		f.vmtxAdv = advances
+		f.vmtxTSB = tsbs
+		f.numVMetrics = vhea.numberOfVMetrics
+		f.vmtxParsed = true
 	})
 }
 

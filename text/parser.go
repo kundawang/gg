@@ -57,6 +57,34 @@ type VariableAdvanceProvider interface {
 	GlyphAdvanceVar(glyphIndex uint16, ppem float64, variations []FontVariation) float64
 }
 
+// VerticalMetricProvider is an optional interface that ParsedFont
+// implementations may implement to provide vertical layout metrics sourced
+// from the vhea/vmtx tables.
+//
+// When the font has no vertical tables, HasVerticalMetrics returns false and
+// the remaining methods synthesize em-square fallback metrics:
+//   - VerticalAdvance equals the font size (one em per glyph),
+//   - the vertical origin is the horizontal center of the em square,
+//     half an em above the horizontal baseline.
+//
+// All distances are in pixels at the given ppem, using the Y-down pixel
+// convention (positive Y points downward).
+type VerticalMetricProvider interface {
+	// HasVerticalMetrics reports whether real vhea/vmtx metrics are present.
+	HasVerticalMetrics() bool
+
+	// VerticalAdvance returns the vertical advance height in pixels.
+	VerticalAdvance(glyphIndex uint16, ppem float64) float64
+
+	// VerticalOrigin returns the vertical origin position relative to the
+	// horizontal origin (baseline origin), in Y-down pixels.
+	VerticalOrigin(glyphIndex uint16, ppem float64) (x, y float64)
+
+	// VerticalLineGap returns the recommended extra gap between vertical
+	// columns in pixels.
+	VerticalLineGap(ppem float64) float64
+}
+
 // FontMetrics holds font-level metrics at a specific size.
 type FontMetrics struct {
 	// Ascent is the distance from the baseline to the top of the font (positive).

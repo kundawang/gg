@@ -57,6 +57,21 @@ type LayoutOptions struct {
 	// Default is WrapWordChar which breaks at word boundaries first,
 	// then falls back to character boundaries for long words.
 	WrapMode WrapMode
+
+	// Vertical enables vertical (column-based) layout when non-nil.
+	// When nil, horizontal line layout is used and all other fields above
+	// behave exactly as before.
+	//
+	// In vertical mode, Direction must be DirectionTTB (default) or
+	// DirectionBTT, hard line breaks start new columns, and MaxWidth is
+	// interpreted as the maximum column height (a non-finite or <= 0 value
+	// disables column wrapping).
+	Vertical *VerticalOptions
+}
+
+// IsVerticalLayout reports whether the options select vertical layout.
+func (o LayoutOptions) IsVerticalLayout() bool {
+	return o.Vertical != nil && o.Direction.IsVertical()
 }
 
 // DefaultLayoutOptions returns sensible default layout options.
@@ -98,16 +113,57 @@ func (l *Line) Height() float64 {
 	return l.Ascent + l.Descent
 }
 
-// Layout represents the result of text layout.
-type Layout struct {
-	// Lines contains all lines of laid out text.
-	Lines []Line
+// Column represents a positioned vertical column of text.
+//
+// Glyph positions are absolute within the layout (same coordinate space as
+// horizontal Line glyphs: origin at the layout's top-left, Y increasing
+// downward). Each glyph records its resolved VerticalOrient; sideways runs
+// are rotated 90° clockwise at render time.
+//
+// X is the column center line (the vertical baseline). Width is the
+// column's full horizontal extent including rotated runs; Height is its
+// block-axis extent.
+type Column struct {
+	// Runs contains the shaped runs that make up this column.
+	Runs []ShapedRun
 
-	// Width is the maximum width among all lines.
+	// Glyphs contains all glyphs from Runs, positioned for rendering.
+	Glyphs []ShapedGlyph
+
+	// X is the center line of the column.
+	X float64
+
+	// Width is the full horizontal extent of the column.
 	Width float64
 
-	// Height is the total height of all lines.
+	// Height is the total vertical advance of all glyphs in the column.
 	Height float64
+
+	// Ascent is the distance from the center line to the column's left edge.
+	Ascent float64
+
+	// Descent is the distance from the center line to the column's right edge.
+	Descent float64
+}
+
+// Layout represents the result of text layout.
+type Layout struct {
+	// Lines contains all lines of laid out horizontal text.
+	// Empty for vertical layouts; use Columns there.
+	Lines []Line
+
+	// Columns contains all columns of laid out vertical text.
+	// Empty for horizontal layouts; use Lines there.
+	Columns []Column
+
+	// Width is the maximum width among all lines or columns.
+	Width float64
+
+	// Height is the total height of all lines or columns.
+	Height float64
+
+	// Vertical is true when this layout was produced in vertical mode.
+	Vertical bool
 }
 
 // LayoutText performs text layout with the given options.
@@ -130,10 +186,10 @@ func LayoutText(text string, face Face, opts LayoutOptions) *Layout {
 // When canceled, returns nil and ctx.Err().
 func LayoutTextWithContext(ctx context.Context, text string, face Face, opts LayoutOptions) (*Layout, error) {
 	if text == "" {
-		return &Layout{}, nil
+		return &Layout{Vertical: opts.IsVerticalLayout()}, nil
 	}
 	if face == nil {
-		return &Layout{}, nil
+		return &Layout{Vertical: opts.IsVerticalLayout()}, nil
 	}
 
 	// Check for cancellation at start
@@ -146,6 +202,18 @@ func LayoutTextWithContext(ctx context.Context, text string, face Face, opts Lay
 	// Apply defaults for zero values
 	if opts.LineSpacing <= 0 {
 		opts.LineSpacing = 1.0
+	}
+
+	// Non-finite MaxWidth (NaN/Inf) cannot constrain wrapping: treat as
+	// unbounded so every layout path receives a well-defined dimension.
+	if !finiteWidth(opts.MaxWidth) {
+		opts.MaxWidth = 0
+	}
+
+	// Vertical layout is a fully separate pipeline; horizontal behavior is
+	// byte-for-byte unchanged when Vertical is nil.
+	if opts.IsVerticalLayout() {
+		return layoutTextVertical(ctx, text, face, opts)
 	}
 
 	// Get font metrics for line height calculation
