@@ -15,9 +15,10 @@
 //   - GSUB: single (Type 1), multiple (Type 2), alternate (Type 3),
 //     ligature (Type 4), extension (Type 7)
 //   - GPOS: single adjustment (Type 1), pair adjustment/kerning (Type 2),
-//     extension (Type 9)
+//     contextual (Type 7, formats 1/2/3), chaining contextual
+//     (Type 8, formats 1/2/3), extension (Type 9)
 //   - kern: format 0 fallback pairs
-//   - Default features: 'liga' (ligatures), 'kern' (kerning)
+//   - Default features: 'liga' (ligatures), 'kern' (kerning), 'dist' (distances)
 //
 // OwnShaper is safe for concurrent use. Parsed table caches are protected
 // by sync.Once (per FontSource) and sync.RWMutex (for the cache map).
@@ -287,7 +288,13 @@ func runeToGlyphs(runes []rune, sc *ownShaperCache) []shapingGlyph {
 // Users who want strictly HarfBuzz-compatible behavior can disable 'dlig'
 // explicitly with text.NoDLigatures.
 //
-// Default GPOS features: kern.
+// Default GPOS features: kern, dist.
+//
+// 'dist' (distances) is applied by default because complex-script fonts
+// (notably Devanagari and other Indic scripts) encode required contextual
+// glyph placement there rather than in 'kern'; HarfBuzz enables it by
+// default as well. Its lookups are positioning-only and never change
+// advances destructively, so enabling it cannot regress simple Latin text.
 func collectDesiredFeatures(userFeatures []FontFeature) (gsubTags, gposTags [][4]byte) {
 	// Default features.
 	ccmp := [4]byte{'c', 'c', 'm', 'p'}
@@ -296,6 +303,7 @@ func collectDesiredFeatures(userFeatures []FontFeature) (gsubTags, gposTags [][4
 	clig := [4]byte{'c', 'l', 'i', 'g'}
 	rlig := [4]byte{'r', 'l', 'i', 'g'}
 	dlig := [4]byte{'d', 'l', 'i', 'g'}
+	dist := [4]byte{'d', 'i', 's', 't'}
 
 	// GSUB defaults.
 	gsubEnabled := map[[4]byte]bool{
@@ -309,6 +317,7 @@ func collectDesiredFeatures(userFeatures []FontFeature) (gsubTags, gposTags [][4
 	// GPOS defaults.
 	gposEnabled := map[[4]byte]bool{
 		kern: true,
+		dist: true,
 	}
 
 	// Apply user overrides.

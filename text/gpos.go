@@ -7,6 +7,8 @@
 //   - Type 2: Pair adjustment (kerning: position two adjacent glyphs)
 //   - Format 1: Specific pair list
 //   - Format 2: Class-based pairs
+//   - Type 7: Contextual positioning (formats 1/2/3, see gpos_context.go)
+//   - Type 8: Chaining contextual positioning (formats 1/2/3)
 //   - Type 9: Extension positioning (wrapper for above types in large fonts)
 //
 // Reference: https://learn.microsoft.com/en-us/typography/opentype/spec/gpos
@@ -53,30 +55,69 @@ type gposAdjustment struct {
 
 // applyGPOS applies GPOS positioning to a glyph buffer.
 // Returns per-glyph adjustments in font units.
+//
+// Contextual lookups (types 7/8) can encounter malformed tables or exhaust
+// the engine's safety budgets. Such conditions never panic: positioning
+// stops with the adjustments accumulated so far. Callers that need to know
+// whether a stop occurred can use applyGPOSChecked.
 func (g *gposTable) applyGPOS(
 	glyphs []shapingGlyph,
 	scriptTag, langTag [4]byte,
 	desiredTags [][4]byte,
 ) []gposAdjustment {
+	adjustments, _ := g.applyGPOSChecked(glyphs, scriptTag, langTag, desiredTags)
+	return adjustments
+}
+
+// applyGPOSChecked is applyGPOS plus the first contextual safety error
+// encountered. A non-nil error means the GPOS table is malformed (or an
+// adversarial table exceeded the depth/operation budget); the returned
+// adjustments remain valid up to the point where processing stopped.
+func (g *gposTable) applyGPOSChecked(
+	glyphs []shapingGlyph,
+	scriptTag, langTag [4]byte,
+	desiredTags [][4]byte,
+) ([]gposAdjustment, error) {
 	adjustments := make([]gposAdjustment, len(glyphs))
 
 	lookupIndices := collectLookupIndices(g.scripts, g.features, scriptTag, langTag, desiredTags)
+	engine := &gposEngine{g: g, glyphs: glyphs, adj: adjustments}
 	for _, li := range lookupIndices {
 		if int(li) >= len(g.lookups) {
 			continue
 		}
-		g.applyLookup(&g.lookups[li], glyphs, adjustments)
+		g.applyLookup(&g.lookups[li], glyphs, adjustments, engine)
+		if engine.err != nil {
+			// A malformed table or exhausted safety budget stops further
+			// lookups; adjustments accumulated so far remain valid.
+			break
+		}
 	}
-	return adjustments
+	return adjustments, engine.err
 }
 
 // applyLookup applies a single GPOS lookup.
-func (g *gposTable) applyLookup(lu *otLookup, glyphs []shapingGlyph, adj []gposAdjustment) {
+func (g *gposTable) applyLookup(lu *otLookup, glyphs []shapingGlyph, adj []gposAdjustment, engine *gposEngine) {
 	lookupType := lu.lookupType
 
-	// Extension positioning (Type 9) wraps another lookup type.
+	// Extension positioning (Type 9) wraps another lookup type. Route it
+	// through the engine so extensions wrapping contextual lookups (7/8)
+	// get nested-lookup dispatch and safety checks.
 	if lookupType == 9 {
-		g.applyExtensionLookup(lu, glyphs, adj)
+		engine = g.ensureEngine(engine, glyphs, adj)
+		for _, st := range lu.subtables {
+			engine.applyTopLevelExtension(st)
+			if engine.err != nil {
+				return
+			}
+		}
+		return
+	}
+
+	// Contextual lookups need the shared engine for nested-lookup dispatch,
+	// depth/cycle protection and the operation budget.
+	if lookupType == 7 || lookupType == 8 {
+		g.applyContextLookup(lu, glyphs, adj, engine, lookupType)
 		return
 	}
 
@@ -85,22 +126,30 @@ func (g *gposTable) applyLookup(lu *otLookup, glyphs []shapingGlyph, adj []gposA
 	}
 }
 
-// applyExtensionLookup handles GPOS Lookup Type 9 (Extension Positioning).
-func (g *gposTable) applyExtensionLookup(lu *otLookup, glyphs []shapingGlyph, adj []gposAdjustment) {
+// ensureEngine returns the shared engine, creating a default one when the
+// lookup was invoked outside an applyGPOSChecked run.
+func (g *gposTable) ensureEngine(engine *gposEngine, glyphs []shapingGlyph, adj []gposAdjustment) *gposEngine {
+	if engine != nil {
+		return engine
+	}
+	return &gposEngine{g: g, glyphs: glyphs, adj: adj}
+}
+
+// applyContextLookup applies a Type 7 (contextual) or Type 8 (chaining)
+// lookup subtables through the shared safety engine.
+func (g *gposTable) applyContextLookup(
+	lu *otLookup, glyphs []shapingGlyph, adj []gposAdjustment, engine *gposEngine, lookupType uint16,
+) {
+	engine = g.ensureEngine(engine, glyphs, adj)
 	for _, st := range lu.subtables {
-		if len(st) < 8 {
-			continue
+		if lookupType == 7 {
+			engine.applyContextual(st)
+		} else {
+			engine.applyChaining(st)
 		}
-		format := binary.BigEndian.Uint16(st[0:2])
-		if format != 1 {
-			continue
+		if engine.err != nil {
+			return
 		}
-		extType := binary.BigEndian.Uint16(st[2:4])
-		extOffset := binary.BigEndian.Uint32(st[4:8])
-		if int(extOffset) >= len(st) {
-			continue
-		}
-		g.applySubtable(extType, st[extOffset:], glyphs, adj)
 	}
 }
 
@@ -112,8 +161,9 @@ func (g *gposTable) applySubtable(lookupType uint16, data []byte, glyphs []shapi
 	case 2:
 		applyPairPos(data, glyphs, adj)
 	default:
-		// Types 3-8 (cursive, mark-to-base, mark-to-ligature, mark-to-mark,
-		// context, chaining context) not yet implemented.
+		// Types 3-6 (cursive, mark-to-base, mark-to-ligature, mark-to-mark)
+		// not yet implemented. Types 7/8 (context, chaining) and 9
+		// (extension) are dispatched in applyLookup via the gposEngine.
 	}
 }
 

@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Contextual and chaining contextual GPOS positioning** —
+  The pure-Go shaper now implements GPOS Lookup Type 7 (contextual) and
+  Type 8 (chaining contextual), all three formats each, with nested lookup
+  dispatch through Type 9 extensions and position-scoped SinglePos/PairPos
+  application. Value records, coverage and ClassDef sequences are resolved
+  per OpenType spec, so Arabic and Indic fonts that position glyphs from
+  surrounding context (including the default-enabled `dist` feature) now
+  match HarfBuzz output. Matching is non-consuming: unmatched glyphs keep
+  their adjustments and no glyph is double-positioned. Malformed tables,
+  bad offsets, lookup cycles, deep nesting and adversarial rule sets stop
+  safely via bounds-checked readers, a depth limit and an operation budget,
+  surfaced as `text.GPOSError` through the new `applyGPOSChecked` entry
+  point; existing `applyGPOS` behavior is unchanged.
+
 ### Fixed
 
 - **Text-outline glyph cache collision between font faces** ([#514](https://github.com/gogpu/gg/pull/514), @kivutar) —

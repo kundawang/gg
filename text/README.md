@@ -151,8 +151,18 @@ width := text.MeasureText("Hello World", face)
 
 ### OwnShaper (default, GSUB/GPOS)
 
-The default shaper provides Pure Go GSUB/GPOS support including ligatures,
-kerning, and contextual alternates without any external dependencies.
+The default shaper provides Pure Go GSUB/GPOS support without any external
+dependencies:
+
+- **GSUB** — single, multiple, alternate and ligature substitution
+- **GPOS** — single adjustment, pair kerning, and contextual / chaining
+  contextual positioning (Type 7/8, formats 1–3) with nested lookup
+  dispatch, including the `dist` feature used by Indic and Arabic fonts
+- **kern** — legacy kern-table fallback when GPOS kerning is absent
+
+Contextual GPOS is fully bounds-checked: malformed tables, lookup cycles,
+deep nesting and oversized rule sets stop safely (optionally surfaced via
+`GPOSError`) instead of panicking, and unmatched glyphs are never consumed.
 
 ### Custom Shaper
 

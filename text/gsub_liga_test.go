@@ -168,9 +168,11 @@ func TestGSUB_DefaultFeatures(t *testing.T) {
 		}
 	}
 
-	// GPOS must include kern.
+	// GPOS must include kern and dist (distances are required for Indic and
+	// other complex scripts and are enabled by HarfBuzz by default as well).
 	wantGPOS := map[[4]byte]bool{
 		{'k', 'e', 'r', 'n'}: true,
+		{'d', 'i', 's', 't'}: true,
 	}
 	gotGPOS := make(map[[4]byte]bool, len(gposTags))
 	for _, tag := range gposTags {
