@@ -13,7 +13,11 @@
 //
 // Supported features:
 //   - GSUB: single (Type 1), multiple (Type 2), alternate (Type 3),
-//     ligature (Type 4), extension (Type 7)
+//     ligature (Type 4), context (Type 5, formats 1/2/3),
+//     chain context (Type 6, formats 1/2/3), extension (Type 7) and
+//     reverse chain single (Type 8), with GDEF-backed lookup flags
+//     (IgnoreMarks/IgnoreLigatures/IgnoreBases, mark filtering sets) and
+//     bounded nested SubstLookupRecord recursion.
 //   - GPOS: single adjustment (Type 1), pair adjustment/kerning (Type 2),
 //     extension (Type 9)
 //   - kern: format 0 fallback pairs
@@ -93,6 +97,10 @@ func (s *OwnShaper) Shape(text string, face Face) []ShapedGlyph {
 
 	// Step 3: Determine which features to apply.
 	desiredGSUB, desiredGPOS := collectDesiredFeatures(face.Features())
+	// The static feature table does not know every font-specific tag;
+	// reclassify unknown enabled tags according to the table that actually
+	// defines them (GSUB vs GPOS).
+	desiredGSUB, desiredGPOS = sc.classifyFeatureTags(desiredGSUB, desiredGPOS)
 
 	// Step 4: Apply GSUB substitutions.
 	if sc.gsub != nil && len(desiredGSUB) > 0 {
@@ -189,6 +197,11 @@ func buildShaperCache(source *FontSource) *ownShaperCache {
 	// Parse GSUB.
 	if gsubData, ok := tables["GSUB"]; ok {
 		sc.gsub = parseGSUB(gsubData)
+		// GDEF provides glyph classes and mark filtering sets consumed by
+		// GSUB lookup flags (IgnoreMarks, UseMarkFilteringSet).
+		if gdefData, ok := tables["GDEF"]; ok && sc.gsub != nil {
+			sc.gsub.gdef = parseGDEF(gdefData)
+		}
 	}
 
 	// Parse GPOS.
@@ -365,6 +378,93 @@ func gposHasKern(gpos *gposTable, scriptTag, langTag [4]byte) bool {
 	kernTag := [4]byte{'k', 'e', 'r', 'n'}
 	indices := collectLookupIndices(gpos.scripts, gpos.features, scriptTag, langTag, [][4]byte{kernTag})
 	return len(indices) > 0
+}
+
+// classifyFeatureTags moves enabled feature tags between the GSUB and GPOS
+// buckets based on the tables actually present in the font. The static
+// isGSUBFeature heuristic cannot know font-specific tags (e.g. "cf01");
+// routing through the parsed feature lists makes user-requested tags apply
+// against the right table regardless of naming.
+func (sc *ownShaperCache) classifyFeatureTags(gsubTags, gposTags [][4]byte) ([][4]byte, [][4]byte) {
+	if sc.gsub == nil && sc.gpos == nil {
+		return gsubTags, gposTags
+	}
+	inGSUB := make(map[[4]byte]bool, len(sc.gsubFeatures()))
+	for _, tag := range sc.gsubFeatures() {
+		inGSUB[tag] = true
+	}
+	inGPOS := make(map[[4]byte]bool, len(sc.gposFeatures()))
+	for _, tag := range sc.gposFeatures() {
+		inGPOS[tag] = true
+	}
+
+	merged := make(map[[4]byte]bool, len(gsubTags)+len(gposTags))
+	for _, tag := range gsubTags {
+		merged[tag] = true
+	}
+	for _, tag := range gposTags {
+		merged[tag] = true
+	}
+
+	var outGSUB, outGPOS [][4]byte
+	for tag := range merged {
+		switch {
+		case inGSUB[tag]:
+			outGSUB = append(outGSUB, tag)
+		case inGPOS[tag]:
+			outGPOS = append(outGPOS, tag)
+		default:
+			// Unknown to both tables: keep the static heuristic's bucket.
+			if containsTag(gsubTags, tag) {
+				outGSUB = append(outGSUB, tag)
+			} else {
+				outGPOS = append(outGPOS, tag)
+			}
+		}
+	}
+	return outGSUB, outGPOS
+}
+
+// gsubFeatures returns the distinct feature tags declared in the GSUB table.
+func (sc *ownShaperCache) gsubFeatures() [][4]byte {
+	if sc.gsub == nil {
+		return nil
+	}
+	tags := make([][4]byte, 0, len(sc.gsub.features))
+	seen := make(map[[4]byte]bool, len(sc.gsub.features))
+	for _, f := range sc.gsub.features {
+		if !seen[f.tag] {
+			seen[f.tag] = true
+			tags = append(tags, f.tag)
+		}
+	}
+	return tags
+}
+
+// gposFeatures returns the distinct feature tags declared in the GPOS table.
+func (sc *ownShaperCache) gposFeatures() [][4]byte {
+	if sc.gpos == nil {
+		return nil
+	}
+	tags := make([][4]byte, 0, len(sc.gpos.features))
+	seen := make(map[[4]byte]bool, len(sc.gpos.features))
+	for _, f := range sc.gpos.features {
+		if !seen[f.tag] {
+			seen[f.tag] = true
+			tags = append(tags, f.tag)
+		}
+	}
+	return tags
+}
+
+// containsTag reports whether tags contains tag.
+func containsTag(tags [][4]byte, tag [4]byte) bool {
+	for _, t := range tags {
+		if t == tag {
+			return true
+		}
+	}
+	return false
 }
 
 // buildShapedGlyphs converts internal glyph entries + adjustments to ShapedGlyph output.

@@ -7,7 +7,17 @@
 //   - Type 2: Multiple substitution (one-to-many expansion)
 //   - Type 3: Alternate substitution (one-of-many selection)
 //   - Type 4: Ligature substitution (many-to-one contraction, e.g. fi, ffi)
+//   - Type 5: Context substitution, formats 1 (glyph), 2 (class), 3 (coverage)
+//   - Type 6: Chain context substitution, formats 1/2/3 with backtrack and
+//     lookahead sequences
 //   - Type 7: Extension substitution (wrapper for above types in large fonts)
+//   - Type 8: Reverse chain single substitution (format 1)
+//
+// The flag-aware engine (gsub_engine.go) applies lookup records in stored
+// order, supports nested SubstLookupRecord recursion with depth and
+// operation budgets, and consults GDEF for mark classes and mark filtering
+// sets. Malformed data never panics: bad offsets, empty coverages, unknown
+// formats and oversized rules degrade to safe no-ops.
 //
 // Reference: https://learn.microsoft.com/en-us/typography/opentype/spec/gsub
 //
@@ -21,6 +31,18 @@ type gsubTable struct {
 	scripts  []otScript
 	features []otFeature
 	lookups  []otLookup
+	gdef     *gdefTable // optional, shared with the engine for lookup flags
+
+	// applyErr holds the first engine error from the most recent applyGSUB
+	// call (cycle/max-ops); nil when shaping completed normally.
+	applyErr error
+}
+
+// applyGSUBError returns the error recorded during the last applyGSUB run,
+// or nil. A non-nil error means shaping stopped early but the returned
+// buffer remains usable.
+func (g *gsubTable) applyGSUBError() error {
+	return g.applyErr
 }
 
 // parseGSUB parses the raw GSUB table data.
@@ -48,20 +70,32 @@ func parseGSUB(data []byte) *gsubTable {
 // which features to apply (e.g. "liga", "smcp").
 //
 // The glyph buffer is modified in-place (glyphs may be added or removed).
-// Returns the resulting glyph buffer.
+// Returns the resulting glyph buffer. Errors caused by malformed tables or
+// exceeded execution limits leave the partially shaped buffer intact and are
+// reported through applyGSUBError.
 func (g *gsubTable) applyGSUB(
 	glyphs []shapingGlyph,
 	scriptTag, langTag [4]byte,
 	desiredTags [][4]byte,
 ) []shapingGlyph {
 	lookupIndices := collectLookupIndices(g.scripts, g.features, scriptTag, langTag, desiredTags)
+
+	engine := &gsubEngine{
+		table:  g,
+		gdef:   g.gdef,
+		glyphs: glyphs,
+	}
 	for _, li := range lookupIndices {
 		if int(li) >= len(g.lookups) {
 			continue
 		}
-		glyphs = g.applyLookup(&g.lookups[li], glyphs)
+		if engine.lastErr != nil {
+			break
+		}
+		engine.applyLookupIndex(int(li))
 	}
-	return glyphs
+	g.applyErr = engine.lastErr
+	return engine.glyphs
 }
 
 // shapingGlyph represents a glyph being shaped with its cluster index.
@@ -70,58 +104,11 @@ type shapingGlyph struct {
 	cluster int // source character index
 }
 
-// applyLookup applies a single GSUB lookup to the glyph buffer.
-func (g *gsubTable) applyLookup(lu *otLookup, glyphs []shapingGlyph) []shapingGlyph {
-	lookupType := lu.lookupType
-
-	// Extension substitution (Type 7) wraps another lookup type.
-	if lookupType == 7 {
-		return g.applyExtensionLookup(lu, glyphs)
-	}
-
-	for _, st := range lu.subtables {
-		glyphs = g.applySubtable(lookupType, st, glyphs)
-	}
-	return glyphs
-}
-
-// applyExtensionLookup handles GSUB Lookup Type 7 (Extension Substitution).
-// Each subtable contains a pointer to the actual substitution subtable.
-func (g *gsubTable) applyExtensionLookup(lu *otLookup, glyphs []shapingGlyph) []shapingGlyph {
-	for _, st := range lu.subtables {
-		if len(st) < 8 {
-			continue
-		}
-		format := binary.BigEndian.Uint16(st[0:2])
-		if format != 1 {
-			continue
-		}
-		extType := binary.BigEndian.Uint16(st[2:4])
-		extOffset := binary.BigEndian.Uint32(st[4:8])
-		if int(extOffset) >= len(st) {
-			continue
-		}
-		glyphs = g.applySubtable(extType, st[extOffset:], glyphs)
-	}
-	return glyphs
-}
-
-// applySubtable dispatches to the correct substitution function.
-func (g *gsubTable) applySubtable(lookupType uint16, data []byte, glyphs []shapingGlyph) []shapingGlyph {
-	switch lookupType {
-	case 1:
-		return applySingleSubst(data, glyphs)
-	case 2:
-		return applyMultipleSubst(data, glyphs)
-	case 3:
-		return applyAlternateSubst(data, glyphs)
-	case 4:
-		return applyLigatureSubst(data, glyphs)
-	default:
-		// Types 5, 6, 8 (contextual, chaining, reverse) not yet implemented.
-		return glyphs
-	}
-}
+// --- Legacy whole-buffer simple substitutions ---
+//
+// The package-level helpers below predate the flag-aware gsubEngine and are
+// retained for the low-level binary-layout unit tests, which build individual
+// subtables by hand. The shaping pipeline itself goes through gsubEngine.
 
 // --- Lookup Type 1: Single Substitution ---
 
@@ -160,112 +147,6 @@ func applySingleSubst(data []byte, glyphs []shapingGlyph) []shapingGlyph {
 			if ok && idx < glyphCount {
 				glyphs[i].gid = binary.BigEndian.Uint16(data[6+idx*2 : 6+idx*2+2])
 			}
-		}
-	}
-	return glyphs
-}
-
-// --- Lookup Type 2: Multiple Substitution ---
-
-// applyMultipleSubst replaces one glyph with a sequence of glyphs.
-func applyMultipleSubst(data []byte, glyphs []shapingGlyph) []shapingGlyph {
-	if len(data) < 6 {
-		return glyphs
-	}
-	format := binary.BigEndian.Uint16(data[0:2])
-	if format != 1 {
-		return glyphs
-	}
-	covOffset := int(binary.BigEndian.Uint16(data[2:4]))
-	if covOffset >= len(data) {
-		return glyphs
-	}
-	cov := parseCoverage(data[covOffset:])
-	if cov == nil {
-		return glyphs
-	}
-	seqCount := int(binary.BigEndian.Uint16(data[4:6]))
-	if len(data) < 6+seqCount*2 {
-		return glyphs
-	}
-
-	// Process from right to left so index shifts do not affect earlier glyphs.
-	for i := len(glyphs) - 1; i >= 0; i-- {
-		idx, ok := cov.contains(glyphs[i].gid)
-		if !ok || idx >= seqCount {
-			continue
-		}
-		seqOffset := int(binary.BigEndian.Uint16(data[6+idx*2 : 6+idx*2+2]))
-		if seqOffset >= len(data) {
-			continue
-		}
-		seq := data[seqOffset:]
-		if len(seq) < 2 {
-			continue
-		}
-		subCount := int(binary.BigEndian.Uint16(seq[0:2]))
-		if len(seq) < 2+subCount*2 || subCount == 0 {
-			continue
-		}
-
-		cluster := glyphs[i].cluster
-		replacement := make([]shapingGlyph, subCount)
-		for j := range subCount {
-			replacement[j] = shapingGlyph{
-				gid:     binary.BigEndian.Uint16(seq[2+j*2 : 2+j*2+2]),
-				cluster: cluster,
-			}
-		}
-
-		// Replace glyphs[i] with replacement.
-		glyphs = sliceReplace(glyphs, i, 1, replacement)
-	}
-	return glyphs
-}
-
-// --- Lookup Type 3: Alternate Substitution ---
-
-// applyAlternateSubst replaces a glyph with an alternate form.
-// Always selects the first alternate (index 0). Full alternate selection
-// would require user-facing API to choose which alternate.
-func applyAlternateSubst(data []byte, glyphs []shapingGlyph) []shapingGlyph {
-	if len(data) < 6 {
-		return glyphs
-	}
-	format := binary.BigEndian.Uint16(data[0:2])
-	if format != 1 {
-		return glyphs
-	}
-	covOffset := int(binary.BigEndian.Uint16(data[2:4]))
-	if covOffset >= len(data) {
-		return glyphs
-	}
-	cov := parseCoverage(data[covOffset:])
-	if cov == nil {
-		return glyphs
-	}
-	altSetCount := int(binary.BigEndian.Uint16(data[4:6]))
-	if len(data) < 6+altSetCount*2 {
-		return glyphs
-	}
-
-	for i := range glyphs {
-		idx, ok := cov.contains(glyphs[i].gid)
-		if !ok || idx >= altSetCount {
-			continue
-		}
-		altSetOffset := int(binary.BigEndian.Uint16(data[6+idx*2 : 6+idx*2+2]))
-		if altSetOffset >= len(data) {
-			continue
-		}
-		altSet := data[altSetOffset:]
-		if len(altSet) < 4 {
-			continue
-		}
-		altCount := int(binary.BigEndian.Uint16(altSet[0:2]))
-		if altCount > 0 && len(altSet) >= 2+altCount*2 {
-			// Select first alternate.
-			glyphs[i].gid = binary.BigEndian.Uint16(altSet[2:4])
 		}
 	}
 	return glyphs

@@ -190,6 +190,9 @@ type otLookup struct {
 	lookupType uint16
 	lookupFlag uint16
 	subtables  [][]byte // raw subtable data slices
+	// markFilteringSet is valid only when lookupFlag has the
+	// UseMarkFilteringSet bit (0x0010); it indexes GDEF MarkGlyphSetsDef.
+	markFilteringSet uint16
 }
 
 // parseLookupList parses the LookupList and returns raw lookup entries.
@@ -225,9 +228,6 @@ func parseLookupTable(data []byte) otLookup {
 	subtableCount := int(binary.BigEndian.Uint16(data[4:6]))
 
 	headerSize := 6
-	// If UseMarkFilteringSet flag (bit 4) is set, there is an extra uint16 after subtable offsets.
-	// We skip it — it is used for mark filtering which is not yet implemented.
-
 	if len(data) < headerSize+subtableCount*2 {
 		return lu
 	}
@@ -239,6 +239,15 @@ func parseLookupTable(data []byte) otLookup {
 			continue
 		}
 		lu.subtables = append(lu.subtables, data[stOffset:])
+	}
+
+	// UseMarkFilteringSet (bit 4) appends a MarkFilteringSet uint16 right
+	// after the subtable offset array.
+	if lu.lookupFlag&lookupFlagUseMarkFilteringSet != 0 {
+		fieldOff := headerSize + subtableCount*2
+		if fieldOff+2 <= len(data) {
+			lu.markFilteringSet = binary.BigEndian.Uint16(data[fieldOff : fieldOff+2])
+		}
 	}
 	return lu
 }
